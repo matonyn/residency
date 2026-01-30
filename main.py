@@ -11,7 +11,7 @@ import traceback
 
 # --- 1. Setup & Config ---
 url: str = os.environ.get("SUPABASE_URL")
-key: str = os.environ.get("SUPABASE_KEY")
+key: str = os.environ.get("SUPABASE_SERVICE_KEY")
 
 print(f"Supabase URL: {url}")
 print(f"Supabase Key exists: {bool(key)}")
