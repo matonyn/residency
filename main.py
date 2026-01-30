@@ -189,20 +189,25 @@ async def trigger_allocation(payload: AllocationRequest):
         results = run_allocation_logic(payload)
         
         # Optionally save results to allocations table
+
         if results:
-            # Transform for storage
+            from datetime import datetime
+            now = datetime.utcnow().isoformat()
             storage_results = [
                 {
-                    "region": r["region_name"],
-                    "specialty": r["specialty_name"],
-                    "allocated_quota": r["allocated_quota"]
+                    "request_id": r.get("request_id") or r.get("node_id") or f"{r['region_name']}|{r['specialty_name']}",
+                    "allocated_count": r["allocated_quota"],
+                    "allocation_date": now
                 }
                 for r in results
             ]
             # Clear old results and insert new
             supabase.table("allocations").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
             supabase.table("allocations").insert(storage_results).execute()
-            
+
+            # Delete all rows from demand_requests after allocation is done
+            supabase.table("demand_requests").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+
         return {
             "status": "success",
             "allocations": results,
