@@ -491,6 +491,26 @@ async def trigger_allocation(payload: AllocationRequest):
         print("\n📝 Step 10: Updating demand_requests status...")
         request_ids = [r["request_id"] for r in results]
         
+        # To avoid unique constraint violation, delete any existing archived rows with same region, specialty, request_year
+        for r in results:
+            try:
+                region = r["region_name"]
+                specialty = r["specialty_name"]
+                request_year = payload.year or datetime.utcnow().year
+                # Delete any archived row with same region, specialty, request_year
+                del_resp = safe_db_call(
+                    f"Delete archived demand_request for {region}, {specialty}, {request_year}",
+                    lambda: supabase.table("demand_requests")
+                        .delete()
+                        .eq("region", region)
+                        .eq("specialty", specialty)
+                        .eq("request_year", request_year)
+                        .eq("archived", True)
+                        .execute()
+                )
+            except Exception as e:
+                print(f"⚠️  Could not delete archived demand_request for {region}, {specialty}, {request_year}: {e}")
+        
         if request_ids:
             update_resp = safe_db_call(
                 f"Update {len(request_ids)} demand_requests",
