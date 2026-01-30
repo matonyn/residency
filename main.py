@@ -202,11 +202,17 @@ async def trigger_allocation(payload: AllocationRequest):
                 for r in results
             ]
             # Clear old results and insert new
-            supabase.table("allocations").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-            supabase.table("allocations").insert(storage_results).execute()
+            del_resp = supabase.table("allocations").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+            ins_resp = supabase.table("allocations").insert(storage_results).execute()
+            if getattr(ins_resp, 'error', None):
+                print("Supabase allocations insert error:", ins_resp.error)
+                return {"status": "error", "error": str(ins_resp.error)}
 
             # Delete all rows from demand_requests after allocation is done
-            supabase.table("demand_requests").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+            del_demands = supabase.table("demand_requests").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+            if getattr(del_demands, 'error', None):
+                print("Supabase demand_requests delete error:", del_demands.error)
+                return {"status": "error", "error": str(del_demands.error)}
 
         return {
             "status": "success",
