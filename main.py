@@ -1,3 +1,10 @@
+@app.delete("/allocations")
+async def delete_allocations():
+    try:
+        resp = supabase.table("allocations").delete().neq("id", "").execute()
+        return {"status": "success", "message": "All allocations deleted"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 import os
 import networkx as nx
 from fastapi import FastAPI, HTTPException
