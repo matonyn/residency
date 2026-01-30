@@ -1,6 +1,6 @@
 fastapi
-uvicorn
-supabase
 networkx
 pandas
 python-dotenv
+supabase
+uvicorn
