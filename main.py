@@ -491,9 +491,6 @@ async def trigger_allocation(payload: AllocationRequest):
         print("\n📝 Step 10: Updating demand_requests status...")
         request_ids = [r["request_id"] for r in results]
         
-        # To avoid unique constraint violation, do NOT delete demand_requests. Only update status and archive fields.
-        # If unique constraint error persists, consider using upsert or handling conflict, but do not delete rows.
-        
         if request_ids:
             update_resp = safe_db_call(
                 f"Update {len(request_ids)} demand_requests",
