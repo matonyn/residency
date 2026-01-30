@@ -585,6 +585,14 @@ async def debug_database():
     
     return results
 
+# --- GET /allocations endpoint ---
+@app.get("/allocations")
+async def get_allocations():
+    try:
+        resp = supabase.table("allocations").select("*").execute()
+        return {"status": "success", "allocations": resp.data}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "allocations": []}
 
 @app.get("/debug/pending-demands")
 async def debug_pending_demands():
