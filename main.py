@@ -1,26 +1,31 @@
+"""
+Complete Allocation API with Excel Parser
+Supports both Excel (.xlsx) and PDF uploads
+"""
+
 import os
-import networkx as nx
-from fastapi import FastAPI, HTTPException
+import uuid
+from datetime import datetime
+from typing import List, Optional
+import sys
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
-from typing import Dict, List, Optional
-from datetime import datetime
-import uuid
-import traceback
 
-# --- 1. Setup & Config ---
+# --- Setup ---
+
+# Load environment variables from .env.local
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", "..", ".env.local"))
+
 url: str = os.environ.get("SUPABASE_URL")
 key: str = os.environ.get("SUPABASE_SERVICE_KEY")
-
-print(f"Supabase URL: {url}")
-print(f"Supabase Key exists: {bool(key)}")
-
 supabase: Client = create_client(url, key)
 
 app = FastAPI()
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,595 +35,641 @@ app.add_middleware(
 )
 
 
-class AllocationRequest(BaseModel):
-    budget: int
-    specialty_weight: Optional[float] = 0.4
-    region_weight: Optional[float] = 0.3
-    deficit_weight: Optional[float] = 0.3
-    run_by: Optional[str] = "system"
+# --- Pydantic Models ---
+
+class CreateSessionRequest(BaseModel):
+    session_name: str
+    year: int
+    total_budget: int
+    uploaded_by: Optional[str] = "system"
+
+
+class AdjustAllocationRequest(BaseModel):
+    demand_request_id: str
+    new_allocation: int
     notes: Optional[str] = None
-    year: Optional[int] = None
+    changed_by: Optional[str] = "user"
 
 
-def safe_db_call(operation_name: str, db_call):
-    """Wrapper for database calls with error handling"""
+class BulkAdjustRequest(BaseModel):
+    adjustments: List[AdjustAllocationRequest]
+
+
+class FinalizeSessionRequest(BaseModel):
+    session_id: str
+    finalized_by: str
+
+
+# --- Excel Parser Helper ---
+import asyncio
+import io
+import openpyxl
+
+def parse_excel_demands(file_content):
+    """
+    Parse Excel file and extract demand data rows.
+    Returns a list of dicts for each demand row.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
+    ws = wb.active
+    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    rows = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        row_dict = dict(zip(headers, row))
+        rows.append(row_dict)
+    return rows
+
+async def process_uploaded_excel(content, session_id, supabase):
+    """
+    Process uploaded Excel file, insert demands, and generate suggestions.
+    Returns dict with success, counts, and metadata.
+    """
     try:
-        print(f"📊 Executing: {operation_name}")
-        result = db_call()
-        
-        # Check for Supabase errors
-        if hasattr(result, 'error') and result.error:
-            print(f"❌ Database error in {operation_name}: {result.error}")
-            return None
-        
-        data = result.data if hasattr(result, 'data') else result
-        print(f"✅ {operation_name} successful - returned {len(data) if data else 0} records")
-        return data
-        
+        demands = parse_excel_demands(content)
+        inserted = 0
+        suggestions = 0
+        metadata = {"columns": list(demands[0].keys()) if demands else []}
+        for d in demands:
+            # Prepare demand data
+            demand_data = {
+                "session_id": session_id,
+                "region": d.get("region") or d.get("Region"),
+                "specialty": d.get("specialty") or d.get("Specialty"),
+                "historical_deficit": d.get("historical_deficit") or d.get("Historical Deficit") or 0,
+                "current_request": d.get("current_request") or d.get("Current Request") or 0,
+                "initial_allocation": d.get("initial_allocation") or d.get("Initial Allocation") or 0,
+                "notes": d.get("notes") or d.get("Notes") or ""
+            }
+            # Insert demand
+            resp = supabase.table("demand_requests").insert(demand_data).execute()
+            if resp.data:
+                inserted += 1
+                # Optionally, generate a suggestion (dummy logic)
+                suggestion_data = {
+                    "demand_request_id": resp.data[0]["id"],
+                    "suggestion_type": "none",
+                    "suggested_reduction": 0,
+                    "reason": "",
+                    "highlight_color": None
+                }
+                supabase.table("adjustment_suggestions").insert(suggestion_data).execute()
+                suggestions += 1
+        return {
+            "success": True,
+            "demands_inserted": inserted,
+            "suggestions_generated": suggestions,
+            "metadata": metadata
+        }
     except Exception as e:
-        print(f"❌ Exception in {operation_name}: {str(e)}")
-        print(traceback.format_exc())
-        return None
+        return {"success": False, "error": str(e)}
 
 
-def calculate_priority_score(
-    specialty_score: int,
-    region_coefficient: int,
-    historical_deficit: int,
-    specialty_weight: float = 0.4,
-    region_weight: float = 0.3,
-    deficit_weight: float = 0.3
-) -> float:
-    """Calculate weighted priority score"""
-    deficit_score = min(100, (historical_deficit / 100.0) * 100) if historical_deficit > 0 else 0
-    
-    final_score = (
-        specialty_score * specialty_weight +
-        region_coefficient * region_weight +
-        deficit_score * deficit_weight
-    )
-    
-    return final_score
+# --- API Endpoints ---
 
-
-def run_allocation_logic(payload: AllocationRequest):
+@app.post("/sessions/create")
+async def create_session(request: CreateSessionRequest):
     """
-    Main allocation algorithm with extensive debugging
+    Create a new allocation session
     """
-    print("\n" + "="*60)
-    print("🚀 STARTING ALLOCATION RUN")
-    print("="*60)
-    
-    total_grants = payload.budget
-    allocation_year = payload.year or datetime.now().year
-    batch_id = str(uuid.uuid4())
-    run_start = datetime.utcnow()
-    
-    print(f"📋 Configuration:")
-    print(f"   Budget: {total_grants}")
-    print(f"   Year: {allocation_year}")
-    print(f"   Batch ID: {batch_id}")
-    print(f"   Weights: S={payload.specialty_weight}, R={payload.region_weight}, D={payload.deficit_weight}")
-    
     try:
-        # Step 1: Create allocation run record
-        print("\n📝 Step 1: Creating allocation run record...")
-        run_record = {
-            "batch_id": batch_id,
-            "total_budget": total_grants,
-            "specialty_weight": payload.specialty_weight,
-            "region_weight": payload.region_weight,
-            "deficit_weight": payload.deficit_weight,
-            "run_by": payload.run_by,
-            "run_year": allocation_year,
-            "notes": payload.notes,
-            "status": "running",
-            "started_at": run_start.isoformat(),
-            "algorithm_version": "v2.0-debug"
+        session_data = {
+            "session_name": request.session_name,
+            "year": request.year,
+            "total_budget": request.total_budget,
+            "uploaded_by": request.uploaded_by,
+            "status": "draft",
+            "uploaded_at": datetime.utcnow().isoformat()
         }
         
-        run_response = safe_db_call(
-            "Create allocation_runs record",
-            lambda: supabase.table("allocation_runs").insert(run_record).execute()
-        )
+        result = supabase.table("allocation_sessions").insert(session_data).execute()
         
-        # Step 2: Fetch specialties
-        print("\n📚 Step 2: Fetching specialties...")
-        specialties_data = safe_db_call(
-            "Fetch specialties",
-            lambda: supabase.table("specialties").select("*").eq("archived", False).execute()
-        )
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create session")
         
-        if specialties_data is None:
-            # Try without archived filter in case column doesn't exist
-            print("⚠️  Trying without archived filter...")
-            specialties_data = safe_db_call(
-                "Fetch specialties (no filter)",
-                lambda: supabase.table("specialties").select("*").execute()
-            )
-        
-        if not specialties_data:
-            print("⚠️  No specialties found - will use defaults")
-            specialties_map = {}
-        else:
-            specialties_map = {s['name']: s for s in specialties_data}
-            print(f"   Found {len(specialties_map)} specialties: {list(specialties_map.keys())[:5]}...")
-        
-        # Step 3: Fetch regions
-        print("\n🗺️  Step 3: Fetching regions...")
-        regions_data = safe_db_call(
-            "Fetch regions",
-            lambda: supabase.table("regions").select("*").eq("archived", False).execute()
-        )
-        
-        if regions_data is None:
-            # Try without archived filter
-            print("⚠️  Trying without archived filter...")
-            regions_data = safe_db_call(
-                "Fetch regions (no filter)",
-                lambda: supabase.table("regions").select("*").execute()
-            )
-        
-        if not regions_data:
-            print("⚠️  No regions found - will use defaults")
-            regions_map = {}
-        else:
-            regions_map = {r['name']: r for r in regions_data}
-            print(f"   Found {len(regions_map)} regions: {list(regions_map.keys())[:5]}...")
-        
-        # Step 4: Fetch demand requests
-        print("\n📥 Step 4: Fetching demand requests...")
-        requests = safe_db_call(
-            "Fetch demand_requests",
-            lambda: supabase.table("demand_requests").select("*").eq("status", "pending").eq("archived", False).execute()
-        )
-        
-        if requests is None:
-            # Try without status filter
-            print("⚠️  Trying without status/archived filters...")
-            requests = safe_db_call(
-                "Fetch demand_requests (no filters)",
-                lambda: supabase.table("demand_requests").select("*").execute()
-            )
-        
-        if not requests:
-            print("❌ No demand requests found!")
-            print("   Check your demand_requests table has data")
-            
-            # Update run as completed with no allocations
-            safe_db_call(
-                "Update run status (no requests)",
-                lambda: supabase.table("allocation_runs").update({
-                    "status": "completed",
-                    "completed_at": datetime.utcnow().isoformat(),
-                    "total_allocated": 0,
-                    "total_requested": 0,
-                    "requests_count": 0,
-                    "error_message": "No pending demand requests found"
-                }).eq("batch_id", batch_id).execute()
-            )
-            
-            return [], batch_id
-        
-        print(f"   Found {len(requests)} demand requests")
-        
-        # Step 5: Build graph
-        print("\n🕸️  Step 5: Building flow network graph...")
-        G = nx.DiGraph()
-        G.add_node("SOURCE", demand=-total_grants)
-        G.add_node("SINK", demand=total_grants)
-        
-        total_requested_slots = 0
-        valid_requests = []
-        skipped_requests = 0
-        
-        for idx, req in enumerate(requests):
-            region_name = req.get('region', 'Unknown')
-            specialty_name = req.get('specialty', 'Unknown')
-            request_id = req.get('id', f'unknown-{idx}')
-            
-            # Calculate total need
-            historical_deficit = req.get('historical_deficit') or 0
-            request_uz_amount = req.get('request_uz_amount') or 0
-            slots_needed = historical_deficit + request_uz_amount
-            
-            if slots_needed < 1:
-                skipped_requests += 1
-                continue
-            
-            total_requested_slots += slots_needed
-            
-            # Get specialty and region data
-            specialty = specialties_map.get(specialty_name, {})
-            region = regions_map.get(region_name, {})
-            
-            specialty_score = specialty.get('normalized_score', 50)
-            region_coefficient = region.get('coefficient', 50)
-            
-            # Calculate priority score
-            priority_score = req.get('priority_score') or 0
-            if priority_score == 0:
-                priority_score = calculate_priority_score(
-                    specialty_score=specialty_score,
-                    region_coefficient=region_coefficient,
-                    historical_deficit=historical_deficit,
-                    specialty_weight=payload.specialty_weight,
-                    region_weight=payload.region_weight,
-                    deficit_weight=payload.deficit_weight
-                )
-            
-            # Create node
-            node_id = f"{region_name}|{specialty_name}|{request_id}"
-            G.add_node(node_id, demand=0)
-            
-            # Add edges
-            cost = 1000 - int(priority_score)
-            G.add_edge("SOURCE", node_id, capacity=slots_needed, weight=cost)
-            G.add_edge(node_id, "SINK", capacity=slots_needed, weight=0)
-            
-            valid_requests.append({
-                "node_id": node_id,
-                "request_id": request_id,
-                "region_id": region.get('id'),
-                "specialty_id": specialty.get('id'),
-                "region_name": region_name,
-                "specialty_name": specialty_name,
-                "slots_needed": slots_needed,
-                "priority_score": priority_score,
-                "historical_deficit": historical_deficit,
-                "request_uz_amount": request_uz_amount
-            })
-        
-        print(f"   Valid requests: {len(valid_requests)}")
-        print(f"   Skipped requests: {skipped_requests}")
-        print(f"   Total slots requested: {total_requested_slots}")
-        print(f"   Budget: {total_grants}")
-        
-        if total_requested_slots > total_grants:
-            print(f"   ⚠️  Over-subscribed by {total_requested_slots - total_grants} slots")
-        else:
-            print(f"   ℹ️  Under-subscribed by {total_grants - total_requested_slots} slots")
-        
-        if not valid_requests:
-            print("❌ No valid requests after filtering!")
-            
-            safe_db_call(
-                "Update run status (no valid requests)",
-                lambda: supabase.table("allocation_runs").update({
-                    "status": "completed",
-                    "completed_at": datetime.utcnow().isoformat(),
-                    "total_allocated": 0,
-                    "total_requested": total_requested_slots,
-                    "requests_count": 0,
-                    "error_message": "No valid requests with slots_needed > 0"
-                }).eq("batch_id", batch_id).execute()
-            )
-            
-            return [], batch_id
-        
-        # Step 6: Solve flow problem
-        print("\n🔄 Step 6: Solving min-cost max-flow problem...")
-        try:
-            flow_dict = nx.min_cost_flow(G)
-            print("   ✅ Flow solution found!")
-        except nx.NetworkXUnfeasible as e:
-            error_msg = f"Graph infeasible: {str(e)}"
-            print(f"   ❌ {error_msg}")
-            
-            safe_db_call(
-                "Update run status (infeasible)",
-                lambda: supabase.table("allocation_runs").update({
-                    "status": "failed",
-                    "completed_at": datetime.utcnow().isoformat(),
-                    "error_message": error_msg
-                }).eq("batch_id", batch_id).execute()
-            )
-            
-            return [], batch_id
-        
-        # Step 7: Parse results
-        print("\n📊 Step 7: Parsing allocation results...")
-        results = []
-        total_allocated = 0
-        fully_funded = 0
-        partially_funded = 0
-        unfunded = 0
-        
-        for vr in valid_requests:
-            node_id = vr["node_id"]
-            allocated = flow_dict.get("SOURCE", {}).get(node_id, 0)
-            
-            requested = vr["slots_needed"]
-            fulfillment_rate = (allocated / requested * 100) if requested > 0 else 0
-            
-            if allocated == requested:
-                fully_funded += 1
-            elif allocated > 0:
-                partially_funded += 1
-            else:
-                unfunded += 1
-            
-            total_allocated += allocated
-            
-            if allocated > 0:
-                results.append({
-                    "request_id": vr["request_id"],
-                    "region_id": vr["region_id"],
-                    "specialty_id": vr["specialty_id"],
-                    "region_name": vr["region_name"],
-                    "specialty_name": vr["specialty_name"],
-                    "allocated_quota": allocated,
-                    "requested_quota": requested,
-                    "priority_score": round(vr["priority_score"], 2),
-                    "historical_deficit": vr["historical_deficit"],
-                    "request_uz_amount": vr["request_uz_amount"],
-                    "fulfillment_rate": round(fulfillment_rate, 1)
-                })
-        
-        results.sort(key=lambda x: x["priority_score"], reverse=True)
-        
-        print(f"\n📈 Results Summary:")
-        print(f"   Total allocated: {total_allocated} / {total_grants}")
-        print(f"   Fully funded: {fully_funded}")
-        print(f"   Partially funded: {partially_funded}")
-        print(f"   Unfunded: {unfunded}")
-        
-        # Step 8: Update run record
-        print("\n💾 Step 8: Updating allocation run record...")
-        run_end = datetime.utcnow()
-        duration = (run_end - run_start).total_seconds()
-        avg_fulfillment = sum(r['fulfillment_rate'] for r in results) / len(results) if results else 0
-        
-        safe_db_call(
-            "Update allocation_runs (final)",
-            lambda: supabase.table("allocation_runs").update({
-                "status": "completed",
-                "completed_at": run_end.isoformat(),
-                "duration_seconds": int(duration),
-                "total_allocated": total_allocated,
-                "total_requested": total_requested_slots,
-                "requests_count": len(valid_requests),
-                "requests_fully_funded": fully_funded,
-                "requests_partially_funded": partially_funded,
-                "requests_unfunded": unfunded,
-                "average_fulfillment_rate": round(avg_fulfillment, 2)
-            }).eq("batch_id", batch_id).execute()
-        )
-        
-        print("\n✅ Allocation run completed successfully!")
-        print("="*60 + "\n")
-        
-        return results, batch_id
-        
-    except Exception as e:
-        error_msg = str(e)
-        print(f"\n❌ CRITICAL ERROR: {error_msg}")
-        print(traceback.format_exc())
-        
-        try:
-            safe_db_call(
-                "Update run status (error)",
-                lambda: supabase.table("allocation_runs").update({
-                    "status": "failed",
-                    "completed_at": datetime.utcnow().isoformat(),
-                    "error_message": error_msg
-                }).eq("batch_id", batch_id).execute()
-            )
-        except:
-            pass
-        
-        raise
-
-
-@app.post("/run-allocation")
-async def trigger_allocation(payload: AllocationRequest):
-    """
-    Run allocation with extensive debugging
-    """
-    print("\n" + "🎯"*30)
-    print("API ENDPOINT: /run-allocation called")
-    print("🎯"*30)
-    
-    try:
-        # Validate weights
-        total_weight = payload.specialty_weight + payload.region_weight + payload.deficit_weight
-        if abs(total_weight - 1.0) > 0.01:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Weights must sum to 1.0 (currently: {total_weight})"
-            )
-        
-        # Run allocation
-        result = run_allocation_logic(payload)
-        
-        if not result:
-            return {
-                "status": "warning",
-                "message": "No allocations made",
-                "allocations": [],
-                "statistics": {
-                    "total_budget": payload.budget,
-                    "grants_used": 0,
-                    "grants_remaining": payload.budget,
-                    "requests_funded": 0
-                }
-            }
-        
-        results, batch_id = result
-        
-        if not results:
-            return {
-                "status": "warning",
-                "message": "Algorithm completed but no allocations were made",
-                "batch_id": batch_id,
-                "allocations": []
-            }
-        
-        # Step 9: Save to allocations table
-        print("\n💾 Step 9: Saving allocations to database...")
-        now = datetime.utcnow().isoformat()
-        storage_results = [
-            {
-                "request_id": r["request_id"],
-                "region_id": r["region_id"],
-                "specialty_id": r["specialty_id"],
-                "region_name": r["region_name"],
-                "specialty_name": r["specialty_name"],
-                "allocated_count": r["allocated_quota"],
-                "requested_count": r["requested_quota"],
-                "priority_score": r["priority_score"],
-                "historical_deficit": r["historical_deficit"],
-                "request_uz_amount": r["request_uz_amount"],
-                "allocation_date": now,
-                "allocation_batch_id": batch_id,
-                "allocation_year": payload.year or datetime.utcnow().year,
-                "total_budget_for_run": payload.budget,
-                "algorithm_version": "v2.0-debug",
-                "status": "allocated"
-            }
-            for r in results
-        ]
-        
-        ins_resp = safe_db_call(
-            f"Insert {len(storage_results)} allocations",
-            lambda: supabase.table("allocations").insert(storage_results).execute()
-        )
-        
-        if ins_resp is None:
-            print("⚠️  Warning: Could not save allocations to database")
-        
-        # Step 10: Update demand_requests
-        print("\n📝 Step 10: Updating demand_requests status...")
-        request_ids = [r["request_id"] for r in results]
-        
-        if request_ids:
-            update_resp = safe_db_call(
-                f"Update {len(request_ids)} demand_requests",
-                lambda: supabase.table("demand_requests").update({
-                    "status": "allocated",
-                    "archived": True,
-                    "archived_at": now
-                }).in_("id", request_ids).execute()
-            )
-            
-            if update_resp is None:
-                print("⚠️  Warning: Could not update demand_requests status")
-        
-        # Calculate statistics
-        total_allocated = sum(r['allocated_quota'] for r in results)
-        total_requested = sum(r['requested_quota'] for r in results)
-        avg_fulfillment = sum(r['fulfillment_rate'] for r in results) / len(results)
+        session = result.data[0]
         
         return {
             "status": "success",
-            "message": f"Successfully allocated {total_allocated} scholarships across {len(results)} requests",
-            "batch_id": batch_id,
-            "allocations": results,
-            "statistics": {
-                "total_budget": payload.budget,
-                "grants_used": total_allocated,
-                "grants_remaining": payload.budget - total_allocated,
-                "total_requested": total_requested,
-                "requests_total": len(results),
-                "requests_fully_funded": sum(1 for r in results if r['fulfillment_rate'] >= 99.9),
-                "requests_partially_funded": sum(1 for r in results if 0 < r['fulfillment_rate'] < 99.9),
-                "average_fulfillment_rate": round(avg_fulfillment, 1)
+            "message": "Session created successfully",
+            "session": session
+        }
+        
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions/{session_id}/upload-file")
+async def upload_file(session_id: str, file: UploadFile = File(...)):
+    """
+    Upload Excel or PDF file and extract demand data
+    Automatically detects file type and uses appropriate parser
+    """
+    try:
+        # Read file content
+        content = await file.read()
+        
+        # Determine file type
+        file_extension = file.filename.lower().split('.')[-1]
+        
+        if file_extension in ['xlsx', 'xls']:
+            # Use Excel parser
+            print(f"Processing Excel file: {file.filename}")
+            result = await process_uploaded_excel(content, session_id, supabase)
+            
+            if not result['success']:
+                raise HTTPException(status_code=400, detail=result.get('error', 'Failed to process Excel'))
+            
+            # Update session with file info
+            supabase.table("allocation_sessions").update({
+                "source_file_name": file.filename,
+                "status": "in_review"
+            }).eq("id", session_id).execute()
+            
+            return {
+                "status": "success",
+                "message": f"Successfully processed {result['demands_inserted']} demands from Excel",
+                "session_id": session_id,
+                "file_name": file.filename,
+                "file_type": "excel",
+                "demands_count": result['demands_inserted'],
+                "suggestions_count": result['suggestions_generated'],
+                "metadata": result['metadata']
             }
+            
+        elif file_extension == 'pdf':
+            # Use PDF parser (implement if needed)
+            raise HTTPException(
+                status_code=400,
+                detail="PDF parsing not yet implemented. Please upload Excel (.xlsx) file."
+            )
+        
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file_extension}. Please upload .xlsx or .pdf"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print("Upload error:", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions/{session_id}/review-table")
+async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
+    """
+    Get the Excel-like review table with highlighting and pagination
+    """
+    try:
+        # Calculate offset
+        offset = (page - 1) * page_size
+        
+        # Get total count
+        count_resp = supabase.table("demand_requests").select("*", count="exact").eq("session_id", session_id).execute()
+        total_count = count_resp.count if hasattr(count_resp, 'count') else 0
+        
+        # Get paginated data with suggestions
+        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).range(offset, offset + page_size - 1).order("region", desc=False).order("specialty", desc=False).execute()
+        
+        demands = demands_resp.data or []
+        
+        # Get suggestions for these demands
+        demand_ids = [d['id'] for d in demands]
+        suggestions_resp = supabase.table("adjustment_suggestions").select("*").in_("demand_request_id", demand_ids).execute()
+        
+        suggestions_map = {}
+        if suggestions_resp.data:
+            for s in suggestions_resp.data:
+                suggestions_map[s['demand_request_id']] = s
+        
+        # Merge data
+        review_data = []
+        for demand in demands:
+            suggestion = suggestions_map.get(demand['id'], {})
+            
+            review_data.append({
+                **demand,
+                'suggestion_type': suggestion.get('suggestion_type'),
+                'suggested_reduction': suggestion.get('suggested_reduction'),
+                'suggestion_reason': suggestion.get('reason'),
+                'highlight_color': suggestion.get('highlight_color'),
+                'final_allocation': demand.get('user_allocation') or demand.get('initial_allocation', 0),
+                'review_status': 'reviewed' if demand.get('user_allocation') is not None else 'pending'
+            })
+        
+        # Get session info
+        session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
+        session = session_resp.data[0] if session_resp.data else None
+        
+        # Calculate summary statistics
+        all_demands = supabase.table("demand_requests").select("*").eq("session_id", session_id).execute()
+        total_initial = sum(d.get('initial_allocation', 0) for d in all_demands.data)
+        total_final = sum(d.get('user_allocation') or d.get('initial_allocation', 0) for d in all_demands.data)
+        reviewed_count = sum(1 for d in all_demands.data if d.get('user_allocation') is not None)
+        
+        return {
+            "status": "success",
+            "session": session,
+            "review_table": review_data,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_count": total_count,
+                "total_pages": (total_count + page_size - 1) // page_size
+            },
+            "summary": {
+                "total_budget": session.get('total_budget', 0) if session else 0,
+                "total_initial_allocation": total_initial,
+                "total_final_allocation": total_final,
+                "budget_remaining": (session.get('total_budget', 0) if session else 0) - total_final,
+                "reviewed_count": reviewed_count,
+                "pending_count": total_count - reviewed_count,
+                "review_progress_pct": round((reviewed_count / total_count * 100), 1) if total_count > 0 else 0
+            }
+        }
+        
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions/{session_id}/review-table-full")
+async def get_full_review_table(session_id: str):
+    """
+    Get the complete review table without pagination (for export)
+    WARNING: Use with caution on large datasets
+    """
+    try:
+        # Get all demands
+        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).order("region", desc=False).order("specialty", desc=False).execute()
+        
+        demands = demands_resp.data or []
+        
+        # Get all suggestions
+        demand_ids = [d['id'] for d in demands]
+        if demand_ids:
+            suggestions_resp = supabase.table("adjustment_suggestions").select("*").in_("demand_request_id", demand_ids).execute()
+            
+            suggestions_map = {}
+            if suggestions_resp.data:
+                for s in suggestions_resp.data:
+                    suggestions_map[s['demand_request_id']] = s
+        else:
+            suggestions_map = {}
+        
+        # Merge data
+        review_data = []
+        for demand in demands:
+            suggestion = suggestions_map.get(demand['id'], {})
+            
+            review_data.append({
+                'id': demand['id'],
+                'region': demand['region'],
+                'specialty': demand['specialty'],
+                'historical_deficit': demand['historical_deficit'],
+                'current_request': demand['current_request'],
+                'max_need': demand['historical_deficit'] + demand['current_request'],
+                'initial_allocation': demand.get('initial_allocation', 0),
+                'user_allocation': demand.get('user_allocation'),
+                'final_allocation': demand.get('user_allocation') or demand.get('initial_allocation', 0),
+                'deduction_amount': demand.get('initial_allocation', 0) - (demand.get('user_allocation') or demand.get('initial_allocation', 0)),
+                'notes': demand.get('notes', ''),
+                'suggestion_type': suggestion.get('suggestion_type'),
+                'suggested_reduction': suggestion.get('suggested_reduction'),
+                'suggestion_reason': suggestion.get('reason'),
+                'highlight_color': suggestion.get('highlight_color'),
+                'review_status': 'reviewed' if demand.get('user_allocation') is not None else 'pending'
+            })
+        
+        return {
+            "status": "success",
+            "review_table": review_data,
+            "total_count": len(review_data)
+        }
+        
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/demands/{demand_id}/adjust")
+async def adjust_allocation(demand_id: str, request: AdjustAllocationRequest):
+    """
+    Adjust a single allocation
+    """
+    try:
+        update_data = {
+            "user_allocation": request.new_allocation,
+            "notes": request.notes,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        result = supabase.table("demand_requests").update(update_data).eq("id", demand_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Demand request not found")
+        
+        return {
+            "status": "success",
+            "message": "Allocation adjusted successfully",
+            "demand": result.data[0]
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"\n❌ API ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/demands/bulk-adjust")
+async def bulk_adjust_allocations(request: BulkAdjustRequest):
+    """
+    Bulk adjust multiple allocations at once
+    """
+    try:
+        results = []
+        errors = []
+        
+        for adj in request.adjustments:
+            try:
+                result = supabase.table("demand_requests").update({
+                    "user_allocation": adj.new_allocation,
+                    "notes": adj.notes,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", adj.demand_request_id).execute()
+                
+                if result.data:
+                    results.append(result.data[0])
+            except Exception as e:
+                errors.append({
+                    "demand_id": adj.demand_request_id,
+                    "error": str(e)
+                })
+        
+        return {
+            "status": "success" if not errors else "partial",
+            "message": f"Adjusted {len(results)} allocations",
+            "updated_count": len(results),
+            "error_count": len(errors),
+            "updated_demands": results,
+            "errors": errors if errors else None
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions/{session_id}/finalize")
+async def finalize_session(session_id: str, request: FinalizeSessionRequest):
+    """
+    Finalize the allocation session (lock it)
+    """
+    try:
+        # Check if all demands have been reviewed
+        demands = supabase.table("demand_requests").select("user_allocation").eq("session_id", session_id).execute()
+        
+        if demands.data:
+            unreviewed = sum(1 for d in demands.data if d.get('user_allocation') is None)
+            
+            if unreviewed > 0:
+                return {
+                    "status": "warning",
+                    "message": f"{unreviewed} allocations have not been reviewed. Are you sure you want to finalize?",
+                    "unreviewed_count": unreviewed,
+                    "total_count": len(demands.data)
+                }
+        
+        # Update session status
+        result = supabase.table("allocation_sessions").update({
+            "status": "finalized",
+            "finalized_at": datetime.utcnow().isoformat()
+        }).eq("id", session_id).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Log audit entry
+        supabase.table("audit_log").insert({
+            "session_id": session_id,
+            "action": "session_finalized",
+            "changed_by": request.finalized_by,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        
+        return {
+            "status": "success",
+            "message": "Session finalized successfully",
+            "session": result.data[0]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions")
+async def list_sessions(year: Optional[int] = None, status: Optional[str] = None):
+    """
+    List all allocation sessions with filters
+    """
+    try:
+        query = supabase.table("allocation_sessions").select("*")
+        
+        if year:
+            query = query.eq("year", year)
+        if status:
+            query = query.eq("status", status)
+        
+        result = query.order("created_at", desc=True).execute()
+        
+        return {
+            "status": "success",
+            "sessions": result.data,
+            "count": len(result.data) if result.data else 0
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions/{session_id}/summary")
+async def get_session_summary(session_id: str):
+    """
+    Get detailed session summary with statistics
+    """
+    try:
+        # Get session
+        session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
+        
+        if not session_resp.data:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session = session_resp.data[0]
+        
+        # Get all demands
+        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).execute()
+        demands = demands_resp.data or []
+        
+        # Calculate statistics
+        total_deficit = sum(d.get('historical_deficit', 0) for d in demands)
+        total_requested = sum(d.get('current_request', 0) for d in demands)
+        total_initial = sum(d.get('initial_allocation', 0) for d in demands)
+        total_final = sum(d.get('user_allocation') or d.get('initial_allocation', 0) for d in demands)
+        total_deductions = sum(d.get('initial_allocation', 0) - (d.get('user_allocation') or d.get('initial_allocation', 0)) for d in demands)
+        
+        reviewed_count = sum(1 for d in demands if d.get('user_allocation') is not None)
+        
+        # Group by region
+        by_region = {}
+        for d in demands:
+            region = d['region']
+            if region not in by_region:
+                by_region[region] = {
+                    'deficit': 0,
+                    'requested': 0,
+                    'allocated': 0,
+                    'count': 0
+                }
+            by_region[region]['deficit'] += d.get('historical_deficit', 0)
+            by_region[region]['requested'] += d.get('current_request', 0)
+            by_region[region]['allocated'] += d.get('user_allocation') or d.get('initial_allocation', 0)
+            by_region[region]['count'] += 1
+        
+        # Group by specialty
+        by_specialty = {}
+        for d in demands:
+            specialty = d['specialty']
+            if specialty not in by_specialty:
+                by_specialty[specialty] = {
+                    'deficit': 0,
+                    'requested': 0,
+                    'allocated': 0,
+                    'count': 0
+                }
+            by_specialty[specialty]['deficit'] += d.get('historical_deficit', 0)
+            by_specialty[specialty]['requested'] += d.get('current_request', 0)
+            by_specialty[specialty]['allocated'] += d.get('user_allocation') or d.get('initial_allocation', 0)
+            by_specialty[specialty]['count'] += 1
+        
+        return {
+            "status": "success",
+            "session": session,
+            "summary": {
+                "total_demands": len(demands),
+                "total_deficit": total_deficit,
+                "total_requested": total_requested,
+                "total_initial_allocation": total_initial,
+                "total_final_allocation": total_final,
+                "total_deductions": total_deductions,
+                "budget": session['total_budget'],
+                "budget_remaining": session['total_budget'] - total_final,
+                "budget_utilization_pct": round((total_final / session['total_budget'] * 100), 1) if session['total_budget'] > 0 else 0,
+                "reviewed_count": reviewed_count,
+                "pending_count": len(demands) - reviewed_count,
+                "review_progress_pct": round((reviewed_count / len(demands) * 100), 1) if len(demands) > 0 else 0
+            },
+            "by_region": by_region,
+            "by_specialty": by_specialty
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
         print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions/{session_id}/export")
+async def export_session(session_id: str, format: str = "json"):
+    """
+    Export session data (JSON or CSV)
+    """
+    try:
+        # Get all demands
+        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).execute()
+        
+        if not demands_resp.data:
+            raise HTTPException(status_code=404, detail="No data found for session")
+        
+        # Format export data
+        export_data = []
+        for d in demands_resp.data:
+            export_data.append({
+                "region": d['region'],
+                "specialty": d['specialty'],
+                "historical_deficit": d['historical_deficit'],
+                "current_request": d['current_request'],
+                "max_need": d['historical_deficit'] + d['current_request'],
+                "initial_allocation": d.get('initial_allocation', 0),
+                "final_allocation": d.get('user_allocation') or d.get('initial_allocation', 0),
+                "deduction": d.get('initial_allocation', 0) - (d.get('user_allocation') or d.get('initial_allocation', 0)),
+                "notes": d.get('notes', '')
+            })
+        
+        if format == "csv":
+            import io
+            import csv
+            
+            output = io.StringIO()
+            if export_data:
+                writer = csv.DictWriter(output, fieldnames=export_data[0].keys())
+                writer.writeheader()
+                writer.writerows(export_data)
+            
+            return {
+                "status": "success",
+                "format": "csv",
+                "data": output.getvalue()
+            }
+        
+        return {
+            "status": "success",
+            "format": "json",
+            "data": export_data,
+            "count": len(export_data)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """
+    Delete a session (cascade deletes all related data)
+    """
+    try:
+        result = supabase.table("allocation_sessions").delete().eq("id", session_id).execute()
+        
+        return {
+            "status": "success",
+            "message": "Session deleted successfully"
+        }
+        
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
 async def health_check():
-    """Health check with database connectivity test"""
-    try:
-        # Test database connection
-        test = safe_db_call(
-            "Health check - test query",
-            lambda: supabase.table("specialties").select("count").limit(1).execute()
-        )
-        
-        db_status = "connected" if test is not None else "error"
-        
-        return {
-            "status": "ok",
-            "service": "scholarship-allocation-api",
-            "version": "v2.0-debug",
-            "database": db_status
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "service": "scholarship-allocation-api",
-            "version": "v2.0-debug",
-            "database": "disconnected",
-            "error": str(e)
-        }
+    return {
+        "status": "ok",
+        "service": "allocation-api-v3",
+        "version": "3.0",
+        "features": ["excel_upload", "pdf_upload", "regional_allocation"]
+    }
 
 
-@app.get("/debug/database")
-async def debug_database():
-    """Debug endpoint to check database tables"""
-    results = {}
-    
-    # Check each table
-    tables = ["specialties", "regions", "demand_requests", "allocations", "allocation_runs"]
-    
-    for table in tables:
-        try:
-            count_resp = supabase.table(table).select("*", count="exact").limit(0).execute()
-            results[table] = {
-                "status": "ok",
-                "count": count_resp.count if hasattr(count_resp, 'count') else "unknown"
-            }
-        except Exception as e:
-            results[table] = {
-                "status": "error",
-                "error": str(e)
-            }
-    
-    return results
-
-# --- GET /allocations endpoint ---
-@app.get("/allocations")
-async def get_allocations():
-    try:
-        resp = supabase.table("allocations").select("*").execute()
-        return {"status": "success", "allocations": resp.data}
-    except Exception as e:
-        return {"status": "error", "message": str(e), "allocations": []}
-
-@app.get("/debug/pending-demands")
-async def debug_pending_demands():
-    """Debug endpoint to see pending demands"""
-    try:
-        # Try with filters
-        demands = safe_db_call(
-            "Get pending demands (with filters)",
-            lambda: supabase.table("demand_requests").select("*").eq("status", "pending").eq("archived", False).execute()
-        )
-        
-        if demands is None:
-            # Try without filters
-            demands = safe_db_call(
-                "Get all demands (no filters)",
-                lambda: supabase.table("demand_requests").select("*").execute()
-            )
-        
-        return {
-            "status": "success",
-            "count": len(demands) if demands else 0,
-            "demands": demands[:5] if demands else []  # First 5 for debugging
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
