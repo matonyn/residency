@@ -79,6 +79,76 @@ def parse_excel_demands(file_content):
         rows.append(row_dict)
     return rows
 
+
+def _normalize_header(h):
+    """Normalize Excel header for flexible matching."""
+    if h is None:
+        return ""
+    s = str(h).strip().lower().replace(" ", "_").replace("-", "_")
+    return s
+
+
+def parse_excel_graduates(file_content, sheet_name=None, default_year=None):
+    """
+    Parse Excel file and extract yearly graduate data.
+    Expects columns: year (or use default_year), region, specialty, graduate_count (or graduates/count).
+    Optional: use sheet_name to read a specific sheet (e.g. "Graduates" or "Выпускники"); else first sheet.
+    Returns a list of dicts: { year, region, specialty, graduate_count }.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
+    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+    raw_headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    headers = [_normalize_header(h) for h in raw_headers]
+    # Map common column names to canonical keys
+    year_col = None
+    region_col = None
+    specialty_col = None
+    count_col = None
+    for i, h in enumerate(headers):
+        if h in ("year", "год", "г"):
+            year_col = i
+        elif h in ("region", "регион", "область", "region_name"):
+            region_col = i
+        elif h in ("specialty", "speciality", "специальность", "specialty_name"):
+            specialty_col = i
+        elif h in ("graduate_count", "graduates", "count", "количество", "number", "num"):
+            count_col = i
+    if region_col is None or specialty_col is None or count_col is None:
+        raise ValueError(
+            "Excel must have columns for region, specialty, and graduate count. "
+            "Accepted names: region/Region, specialty/Specialty, graduate_count/graduates/count."
+        )
+    rows = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        region = row[region_col] if region_col is not None else None
+        specialty = row[specialty_col] if specialty_col is not None else None
+        count_val = row[count_col] if count_col is not None else None
+        if region is None or specialty is None:
+            continue
+        region = str(region).strip() if region else ""
+        specialty = str(specialty).strip() if specialty else ""
+        if not region or not specialty:
+            continue
+        year_val = default_year
+        if year_col is not None and row[year_col] is not None:
+            try:
+                year_val = int(float(row[year_col]))
+            except (TypeError, ValueError):
+                pass
+        if year_val is None:
+            raise ValueError("Year is required: either include a 'year' column in Excel or pass default_year.")
+        try:
+            graduate_count = int(float(count_val)) if count_val is not None else 0
+        except (TypeError, ValueError):
+            graduate_count = 0
+        rows.append({
+            "year": year_val,
+            "region": region,
+            "specialty": specialty,
+            "graduate_count": max(0, graduate_count),
+        })
+    return rows
+
 async def process_uploaded_excel(content, session_id, supabase):
     """
     Process uploaded Excel file, insert demands, and generate suggestions.
@@ -120,6 +190,46 @@ async def process_uploaded_excel(content, session_id, supabase):
             "suggestions_generated": suggestions,
             "metadata": metadata
         }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def process_uploaded_graduates(content, supabase_client, session_id=None, default_year=None, file_name=None, sheet_name=None):
+    """
+    Process uploaded Excel file with graduate data and upsert into yearly_graduates.
+    default_year: used when Excel has no year column.
+    sheet_name: optional sheet name (e.g. "Graduates"); else first sheet.
+    """
+    try:
+        rows = parse_excel_graduates(content, sheet_name=sheet_name, default_year=default_year)
+        if not rows:
+            return {"success": True, "inserted": 0, "updated": 0, "message": "No rows to import"}
+        inserted = 0
+        for r in rows:
+            payload = {
+                "year": r["year"],
+                "region": r["region"],
+                "specialty": r["specialty"],
+                "graduate_count": r["graduate_count"],
+                "source_file_name": file_name,
+                "uploaded_at": datetime.utcnow().isoformat(),
+            }
+            if session_id:
+                payload["session_id"] = session_id
+            result = supabase_client.table("yearly_graduates").upsert(
+                payload,
+                on_conflict="year,region,specialty",
+            ).execute()
+            if result.data:
+                inserted += 1
+        return {
+            "success": True,
+            "inserted": inserted,
+            "total_rows": len(rows),
+            "metadata": {"columns_used": ["year", "region", "specialty", "graduate_count"]},
+        }
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -660,13 +770,79 @@ async def delete_session(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Yearly Graduates ---
+
+@app.post("/graduates/upload")
+async def upload_graduates(
+    file: UploadFile = File(...),
+    session_id: Optional[str] = None,
+    year: Optional[int] = None,
+    sheet_name: Optional[str] = None,
+):
+    """
+    Upload Excel file with yearly graduate data.
+    Excel columns: region, specialty, graduate_count (or graduates/count). Optional: year (or pass ?year=2024).
+    Optional: session_id to link this data to an allocation session; sheet_name to read a specific sheet.
+    """
+    try:
+        content = await file.read()
+        ext = file.filename.lower().split(".")[-1]
+        if ext not in ("xlsx", "xls"):
+            raise HTTPException(status_code=400, detail="Only Excel (.xlsx, .xls) files are supported.")
+        result = await process_uploaded_graduates(
+            content,
+            supabase,
+            session_id=session_id,
+            default_year=year,
+            file_name=file.filename,
+            sheet_name=sheet_name,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to process file"))
+        return {
+            "status": "success",
+            "message": f"Imported {result.get('inserted', 0)} graduate records",
+            "inserted": result.get("inserted", 0),
+            "total_rows": result.get("total_rows", 0),
+            "metadata": result.get("metadata"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graduates")
+async def list_graduates(year: Optional[int] = None, session_id: Optional[str] = None):
+    """
+    List yearly graduate records. Filter by year and/or session_id.
+    """
+    try:
+        query = supabase.table("yearly_graduates").select("*").order("year", desc=True).order("region").order("specialty")
+        if year is not None:
+            query = query.eq("year", year)
+        if session_id is not None:
+            query = query.eq("session_id", session_id)
+        result = query.execute()
+        data = result.data or []
+        return {
+            "status": "success",
+            "graduates": data,
+            "count": len(data),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
         "service": "allocation-api-v3",
         "version": "3.0",
-        "features": ["excel_upload", "pdf_upload", "regional_allocation"]
+        "features": ["excel_upload", "pdf_upload", "regional_allocation", "yearly_graduates"]
     }
 
 
