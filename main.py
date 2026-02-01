@@ -403,6 +403,16 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
         
         demands = demands_resp.data or []
         
+        # Get session for year (for graduates lookup)
+        session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
+        session = session_resp.data[0] if session_resp.data else None
+        graduate_year = (session.get("year") or datetime.now().year) - 1 if session else (datetime.now().year - 1)
+        graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
+        graduates_map = {}
+        for g in (graduates_resp.data or []):
+            key = f"{g.get('region')}|{g.get('specialty')}"
+            graduates_map[key] = int(g.get("graduate_count") or 0)
+        
         # Get suggestions for these demands
         demand_ids = [d['id'] for d in demands]
         suggestions_resp = supabase.table("adjustment_suggestions").select("*").in_("demand_request_id", demand_ids).execute()
@@ -412,13 +422,17 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
             for s in suggestions_resp.data:
                 suggestions_map[s['demand_request_id']] = s
         
-        # Merge data
+        # Merge data (include graduate_count from previous year)
         review_data = []
         for demand in demands:
             suggestion = suggestions_map.get(demand['id'], {})
-            
+            region = demand.get("region") or ""
+            specialty = demand.get("specialty") or ""
+            graduate_count = graduates_map.get(f"{region}|{specialty}")
             review_data.append({
                 **demand,
+                'graduate_count': graduate_count,
+                'graduate_year': graduate_year,
                 'suggestion_type': suggestion.get('suggestion_type'),
                 'suggested_reduction': suggestion.get('suggested_reduction'),
                 'suggestion_reason': suggestion.get('reason'),
@@ -427,10 +441,7 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
                 'review_status': 'reviewed' if demand.get('user_allocation') is not None else 'pending'
             })
         
-        # Get session info
-        session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
-        session = session_resp.data[0] if session_resp.data else None
-        
+        # Session already fetched above
         # Calculate summary statistics
         all_demands = supabase.table("demand_requests").select("*").eq("session_id", session_id).execute()
         total_initial = sum(d.get('initial_allocation', 0) for d in all_demands.data)
@@ -471,28 +482,31 @@ async def get_full_review_table(session_id: str):
     WARNING: Use with caution on large datasets
     """
     try:
-        # Get all demands
-        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).order("region", desc=False).order("specialty", desc=False).execute()
+        session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
+        session = session_resp.data[0] if session_resp.data else None
+        graduate_year = (session.get("year") or datetime.now().year) - 1 if session else (datetime.now().year - 1)
+        graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
+        graduates_map = {}
+        for g in (graduates_resp.data or []):
+            key = f"{g.get('region')}|{g.get('specialty')}"
+            graduates_map[key] = int(g.get("graduate_count") or 0)
         
+        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).order("region", desc=False).order("specialty", desc=False).execute()
         demands = demands_resp.data or []
         
-        # Get all suggestions
         demand_ids = [d['id'] for d in demands]
         if demand_ids:
             suggestions_resp = supabase.table("adjustment_suggestions").select("*").in_("demand_request_id", demand_ids).execute()
-            
-            suggestions_map = {}
-            if suggestions_resp.data:
-                for s in suggestions_resp.data:
-                    suggestions_map[s['demand_request_id']] = s
+            suggestions_map = {s['demand_request_id']: s for s in (suggestions_resp.data or [])}
         else:
             suggestions_map = {}
         
-        # Merge data
         review_data = []
         for demand in demands:
             suggestion = suggestions_map.get(demand['id'], {})
-            
+            region = demand.get("region") or ""
+            specialty = demand.get("specialty") or ""
+            graduate_count = graduates_map.get(f"{region}|{specialty}")
             review_data.append({
                 'id': demand['id'],
                 'region': demand['region'],
@@ -500,6 +514,8 @@ async def get_full_review_table(session_id: str):
                 'historical_deficit': demand['historical_deficit'],
                 'current_request': demand['current_request'],
                 'max_need': demand['historical_deficit'] + demand['current_request'],
+                'graduate_count': graduate_count,
+                'graduate_year': graduate_year,
                 'initial_allocation': demand.get('initial_allocation', 0),
                 'user_allocation': demand.get('user_allocation'),
                 'final_allocation': demand.get('user_allocation') or demand.get('initial_allocation', 0),
