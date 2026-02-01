@@ -200,9 +200,30 @@ def parse_excel_graduates(file_content, sheet_name=None, default_year=None):
         })
     return rows
 
+def _get_region_specialty_id_maps(supabase_client):
+    """Fetch regions and specialties from DB; return (region_name -> id, specialty_name -> id) for FK resolution."""
+    region_map = {}
+    specialty_map = {}
+    try:
+        regions_resp = supabase_client.table("regions").select("id, name").execute()
+        for r in (regions_resp.data or []):
+            name = (r.get("name") or "").strip()
+            if name:
+                region_map[name] = r.get("id")
+        specialties_resp = supabase_client.table("specialties").select("id, name").execute()
+        for s in (specialties_resp.data or []):
+            name = (s.get("name") or "").strip()
+            if name:
+                specialty_map[name] = s.get("id")
+    except Exception:
+        pass
+    return region_map, specialty_map
+
+
 async def process_uploaded_excel(content, session_id, supabase):
     """
     Process uploaded Excel file, insert demands, and generate suggestions.
+    Resolves region/specialty names to region_id/specialty_id when possible so frontend join works.
     Returns dict with success, counts, and metadata.
     """
     try:
@@ -210,21 +231,28 @@ async def process_uploaded_excel(content, session_id, supabase):
         inserted = 0
         suggestions = 0
         metadata = {"columns": list(demands[0].keys()) if demands else []}
+        region_map, specialty_map = _get_region_specialty_id_maps(supabase)
         for d in demands:
             hist = int(d.get("historical_deficit") or d.get("Historical Deficit") or 0)
             req = int(d.get("current_request") or d.get("Current Request") or 0)
             # Default allocation = max(deficit, request); Excel can override
             initial = d.get("initial_allocation") or d.get("Initial Allocation")
             initial_allocation = int(initial) if initial is not None else max(hist, req)
+            region_name = (d.get("region") or d.get("Region") or "").strip() or None
+            specialty_name = (d.get("specialty") or d.get("Specialty") or "").strip() or None
+            region_id = region_map.get(region_name) if region_name else None
+            specialty_id = specialty_map.get(specialty_name) if specialty_name else None
             demand_data = {
                 "session_id": session_id,
-                "region": d.get("region") or d.get("Region"),
-                "specialty": d.get("specialty") or d.get("Specialty"),
                 "historical_deficit": hist,
                 "current_request": req,
                 "initial_allocation": initial_allocation,
                 "notes": d.get("notes") or d.get("Notes") or ""
             }
+            if region_id is not None:
+                demand_data["region_id"] = region_id
+            if specialty_id is not None:
+                demand_data["specialty_id"] = specialty_id
             resp = supabase.table("demand_requests").insert(demand_data).execute()
             if resp.data:
                 inserted += 1
@@ -398,8 +426,10 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
         count_resp = supabase.table("demand_requests").select("*", count="exact").eq("session_id", session_id).execute()
         total_count = count_resp.count if hasattr(count_resp, 'count') else 0
         
-        # Get paginated data with suggestions
-        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).range(offset, offset + page_size - 1).order("region", desc=False).order("specialty", desc=False).execute()
+        # Get paginated data with suggestions (join regions/specialties for names)
+        demands_resp = supabase.table("demand_requests").select(
+            "*, region:regions(id, name), specialty:specialties(id, name)"
+        ).eq("session_id", session_id).range(offset, offset + page_size - 1).order("region_id").order("specialty_id").execute()
         
         demands = demands_resp.data or []
         
@@ -412,6 +442,13 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
         for g in (graduates_resp.data or []):
             key = f"{g.get('region')}|{g.get('specialty')}"
             graduates_map[key] = int(g.get("graduate_count") or 0)
+        
+        def _region_name(d):
+            r = d.get("region")
+            return r.get("name", "").strip() if isinstance(r, dict) else (d.get("region") or "")
+        def _specialty_name(d):
+            s = d.get("specialty")
+            return s.get("name", "").strip() if isinstance(s, dict) else (d.get("specialty") or "")
         
         # Get suggestions for these demands
         demand_ids = [d['id'] for d in demands]
@@ -426,8 +463,8 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
         review_data = []
         for demand in demands:
             suggestion = suggestions_map.get(demand['id'], {})
-            region = demand.get("region") or ""
-            specialty = demand.get("specialty") or ""
+            region = _region_name(demand)
+            specialty = _specialty_name(demand)
             graduate_count = graduates_map.get(f"{region}|{specialty}")
             review_data.append({
                 **demand,
@@ -491,8 +528,17 @@ async def get_full_review_table(session_id: str):
             key = f"{g.get('region')}|{g.get('specialty')}"
             graduates_map[key] = int(g.get("graduate_count") or 0)
         
-        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).order("region", desc=False).order("specialty", desc=False).execute()
+        demands_resp = supabase.table("demand_requests").select(
+            "*, region:regions(id, name), specialty:specialties(id, name)"
+        ).eq("session_id", session_id).order("region_id").order("specialty_id").execute()
         demands = demands_resp.data or []
+        
+        def _region_name(d):
+            r = d.get("region")
+            return r.get("name", "").strip() if isinstance(r, dict) else (d.get("region") or "")
+        def _specialty_name(d):
+            s = d.get("specialty")
+            return s.get("name", "").strip() if isinstance(s, dict) else (d.get("specialty") or "")
         
         demand_ids = [d['id'] for d in demands]
         if demand_ids:
@@ -504,13 +550,13 @@ async def get_full_review_table(session_id: str):
         review_data = []
         for demand in demands:
             suggestion = suggestions_map.get(demand['id'], {})
-            region = demand.get("region") or ""
-            specialty = demand.get("specialty") or ""
+            region = _region_name(demand)
+            specialty = _specialty_name(demand)
             graduate_count = graduates_map.get(f"{region}|{specialty}")
             review_data.append({
                 'id': demand['id'],
-                'region': demand['region'],
-                'specialty': demand['specialty'],
+                'region': demand.get('region'),
+                'specialty': demand.get('specialty'),
                 'historical_deficit': demand['historical_deficit'],
                 'current_request': demand['current_request'],
                 'max_need': demand['historical_deficit'] + demand['current_request'],
@@ -557,7 +603,9 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
         if total_grants <= 0:
             raise HTTPException(status_code=400, detail="total_grants or session.total_budget must be positive")
 
-        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).execute()
+        demands_resp = supabase.table("demand_requests").select(
+            "*, region:regions(id, name), specialty:specialties(id, name)"
+        ).eq("session_id", session_id).execute()
         demands = demands_resp.data or []
         if not demands:
             return {"status": "success", "message": "No demands to allocate", "updated": 0}
@@ -569,10 +617,17 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
             key = f"{g.get('region')}|{g.get('specialty')}"
             graduates_map[key] = int(g.get("graduate_count") or 0)
 
+        def _demand_region_name(d):
+            r = d.get("region")
+            return r.get("name", "").strip() if isinstance(r, dict) else (d.get("region") or "")
+        def _demand_specialty_name(d):
+            s = d.get("specialty")
+            return s.get("name", "").strip() if isinstance(s, dict) else (d.get("specialty") or "")
+
         rows = []
         for d in demands:
-            region = d.get("region") or ""
-            specialty = d.get("specialty") or ""
+            region = _demand_region_name(d)
+            specialty = _demand_specialty_name(d)
             hist = int(d.get("historical_deficit") or 0)
             req = int(d.get("current_request") or 0)
             grad = graduates_map.get(f"{region}|{specialty}", 0)
