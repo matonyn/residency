@@ -6,7 +6,7 @@ Supports both Excel (.xlsx) and PDF uploads
 import os
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Literal
 import sys
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -58,6 +58,57 @@ class BulkAdjustRequest(BaseModel):
 class FinalizeSessionRequest(BaseModel):
     session_id: str
     finalized_by: str
+
+
+class RunAllocationRequest(BaseModel):
+    """Run weighted allocation for a session. Default: initial_allocation = max(deficit, request). With priority: distribute total_budget by weights."""
+    priority: Literal["historic_deficit", "requested_amount", "last_year_data"] = "historic_deficit"
+    total_grants: Optional[int] = None  # default: session.total_budget
+
+
+# --- Allocation Logic (matches frontend) ---
+
+ALLOCATION_PRIORITIES = ("historic_deficit", "requested_amount", "last_year_data")
+WEIGHTS = {
+    "historic_deficit": {"d": 0.7, "r": 0.15, "g": 0.15},
+    "requested_amount": {"d": 0.15, "r": 0.7, "g": 0.15},
+    "last_year_data": {"d": 0.15, "r": 0.15, "g": 0.7},
+}
+
+
+def compute_weighted_allocation(total_grants: int, priority: str, rows: List[dict]) -> List[int]:
+    """
+    Distribute total_grants across rows by weighted score.
+    Each row has historical_deficit, current_request, graduate_count.
+    Returns list of allocated quotas (same order as rows).
+    """
+    if not rows:
+        return []
+    w = WEIGHTS.get(priority, WEIGHTS["historic_deficit"])
+    scores = []
+    for r in rows:
+        d = max(0, int(r.get("historical_deficit") or 0))
+        req = max(0, int(r.get("current_request") or 0))
+        g = max(0, int(r.get("graduate_count") or 0))
+        scores.append(w["d"] * d + w["r"] * req + w["g"] * g)
+    total_score = sum(scores)
+    if total_score <= 0:
+        per_row = total_grants // len(rows)
+        remainder = total_grants - per_row * len(rows)
+        return [per_row + (1 if i < remainder else 0) for i in range(len(rows))]
+    quotas = []
+    allocated = 0
+    for s in scores:
+        q = int((total_grants * s) / total_score)
+        quotas.append(q)
+        allocated += q
+    remainder = total_grants - allocated
+    # Sort by fractional part descending to assign remainder
+    fracs = [(i, (total_grants * scores[i]) / total_score - int((total_grants * scores[i]) / total_score)) for i in range(len(scores))]
+    fracs.sort(key=lambda x: -x[1])
+    for k in range(remainder):
+        quotas[fracs[k][0]] += 1
+    return quotas
 
 
 # --- Excel Parser Helper ---
@@ -160,29 +211,34 @@ async def process_uploaded_excel(content, session_id, supabase):
         suggestions = 0
         metadata = {"columns": list(demands[0].keys()) if demands else []}
         for d in demands:
-            # Prepare demand data
+            hist = int(d.get("historical_deficit") or d.get("Historical Deficit") or 0)
+            req = int(d.get("current_request") or d.get("Current Request") or 0)
+            # Default allocation = max(deficit, request); Excel can override
+            initial = d.get("initial_allocation") or d.get("Initial Allocation")
+            initial_allocation = int(initial) if initial is not None else max(hist, req)
             demand_data = {
                 "session_id": session_id,
                 "region": d.get("region") or d.get("Region"),
                 "specialty": d.get("specialty") or d.get("Specialty"),
-                "historical_deficit": d.get("historical_deficit") or d.get("Historical Deficit") or 0,
-                "current_request": d.get("current_request") or d.get("Current Request") or 0,
-                "initial_allocation": d.get("initial_allocation") or d.get("Initial Allocation") or 0,
+                "historical_deficit": hist,
+                "current_request": req,
+                "initial_allocation": initial_allocation,
                 "notes": d.get("notes") or d.get("Notes") or ""
             }
-            # Insert demand
             resp = supabase.table("demand_requests").insert(demand_data).execute()
             if resp.data:
                 inserted += 1
-                # Optionally, generate a suggestion (dummy logic)
-                suggestion_data = {
-                    "demand_request_id": resp.data[0]["id"],
-                    "suggestion_type": "none",
-                    "suggested_reduction": 0,
-                    "reason": "",
-                    "highlight_color": None
-                }
-                supabase.table("adjustment_suggestions").insert(suggestion_data).execute()
+                dr_id = resp.data[0]["id"]
+                max_need = max(hist, req)
+                # Highlight: under-allocated (red) or can_reduce (yellow). Schema allows only can_reduce, over_allocated, under_allocated, priority_low.
+                if initial_allocation < max_need:
+                    suggestion_data = {"demand_request_id": dr_id, "suggestion_type": "under_allocated", "suggested_reduction": 0, "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})", "highlight_color": "red"}
+                elif initial_allocation > max_need:
+                    suggestion_data = {"demand_request_id": dr_id, "suggestion_type": "can_reduce", "suggested_reduction": initial_allocation - max_need, "reason": f"Можно уменьшить на {initial_allocation - max_need}", "highlight_color": "yellow"}
+                else:
+                    suggestion_data = None
+                if suggestion_data:
+                    supabase.table("adjustment_suggestions").insert(suggestion_data).execute()
                 suggestions += 1
         return {
             "success": True,
@@ -465,6 +521,98 @@ async def get_full_review_table(session_id: str):
     except Exception as e:
         import traceback
         print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions/{session_id}/run-allocation")
+async def run_allocation(session_id: str, request: RunAllocationRequest):
+    """
+    Run weighted allocation for the session.
+    Default allocation per row = max(historical_deficit, current_request).
+    With priority: distribute total_grants (or session.total_budget) by weights (70% chosen factor, 15% others).
+    Updates demand_requests.initial_allocation and adjustment_suggestions (red/yellow highlight).
+    """
+    try:
+        session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
+        if not session_resp.data:
+            raise HTTPException(status_code=404, detail="Session not found")
+        session = session_resp.data[0]
+        total_grants = request.total_grants if request.total_grants is not None else session.get("total_budget") or 0
+        if total_grants <= 0:
+            raise HTTPException(status_code=400, detail="total_grants or session.total_budget must be positive")
+
+        demands_resp = supabase.table("demand_requests").select("*").eq("session_id", session_id).execute()
+        demands = demands_resp.data or []
+        if not demands:
+            return {"status": "success", "message": "No demands to allocate", "updated": 0}
+
+        graduate_year = (session.get("year") or datetime.now().year) - 1
+        graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
+        graduates_map = {}
+        for g in (graduates_resp.data or []):
+            key = f"{g.get('region')}|{g.get('specialty')}"
+            graduates_map[key] = int(g.get("graduate_count") or 0)
+
+        rows = []
+        for d in demands:
+            region = d.get("region") or ""
+            specialty = d.get("specialty") or ""
+            hist = int(d.get("historical_deficit") or 0)
+            req = int(d.get("current_request") or 0)
+            grad = graduates_map.get(f"{region}|{specialty}", 0)
+            rows.append({
+                "id": d["id"],
+                "historical_deficit": hist,
+                "current_request": req,
+                "graduate_count": grad,
+            })
+
+        quotas = compute_weighted_allocation(total_grants, request.priority, rows)
+        if len(quotas) != len(demands):
+            raise HTTPException(status_code=500, detail="Allocation length mismatch")
+
+        demand_ids = [d["id"] for d in demands]
+        for i, demand in enumerate(demands):
+            new_alloc = quotas[i]
+            supabase.table("demand_requests").update({"initial_allocation": new_alloc}).eq("id", demand["id"]).execute()
+
+        for sid in demand_ids:
+            supabase.table("adjustment_suggestions").delete().eq("demand_request_id", sid).execute()
+
+        for i, demand in enumerate(demands):
+            initial_allocation = quotas[i]
+            hist = int(demand.get("historical_deficit") or 0)
+            req = int(demand.get("current_request") or 0)
+            max_need = max(hist, req)
+            if initial_allocation < max_need:
+                supabase.table("adjustment_suggestions").insert({
+                    "demand_request_id": demand["id"],
+                    "suggestion_type": "under_allocated",
+                    "suggested_reduction": 0,
+                    "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})",
+                    "highlight_color": "red",
+                }).execute()
+            elif initial_allocation > max_need:
+                supabase.table("adjustment_suggestions").insert({
+                    "demand_request_id": demand["id"],
+                    "suggestion_type": "can_reduce",
+                    "suggested_reduction": initial_allocation - max_need,
+                    "reason": f"Можно уменьшить на {initial_allocation - max_need}",
+                    "highlight_color": "yellow",
+                }).execute()
+
+        return {
+            "status": "success",
+            "message": f"Allocation run with priority={request.priority}",
+            "updated": len(demands),
+            "total_grants": total_grants,
+            "priority": request.priority,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
