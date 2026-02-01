@@ -195,10 +195,15 @@ def _normalize_name_for_lookup(name):
 
 
 def _normalize_graduate_key(region_name, specialty_name):
-    """Normalize region|specialty for matching (strip, lowercase, strip 'г.' prefix)."""
+    """Normalize region|specialty for matching (legacy)."""
     r = (region_name or "").strip().lower().replace("г.", "").strip()
     s = (specialty_name or "").strip().lower()
     return f"{r}|{s}"
+
+
+def _normalize_specialty_for_graduate_lookup(specialty_name):
+    """Normalize specialty name for graduate lookup (per-specialty only)."""
+    return _normalize_name_for_lookup(specialty_name or "")
 
 
 def _get_region_specialty_id_maps(supabase_client):
@@ -279,49 +284,58 @@ async def process_uploaded_excel(content, session_id, supabase):
         return {"success": False, "error": str(e)}
 
 
-async def process_uploaded_graduates(content, supabase_client, session_id=None, default_year=None, file_name=None, sheet_name=None):
+async def process_uploaded_graduates(content, supabase_client, session_id=None, default_year=None, file_name=None, sheet_name=None, replace_years=None):
     """
     Process uploaded Excel file with graduate data and upsert into yearly_graduates.
-    Resolves region/specialty names to region_id/specialty_id so frontend can match by ID.
-    default_year: used when Excel has no year column.
-    sheet_name: optional sheet name (e.g. "Graduates"); else first sheet.
+    Stores per specialty only (year, specialty_id, specialty, graduate_count); aggregates by specialty.
+    replace_years: if set, delete existing rows for those years before insert (re-import).
     """
     try:
         rows = parse_excel_graduates(content, sheet_name=sheet_name, default_year=default_year)
         if not rows:
             return {"success": True, "inserted": 0, "updated": 0, "message": "No rows to import"}
-        region_map, specialty_map = _get_region_specialty_id_maps(supabase_client)
-        inserted = 0
+        # Aggregate by (year, specialty): sum graduate_count
+        by_specialty = {}
         for r in rows:
-            region_name = (r.get("region") or "").strip()
+            year = r.get("year")
+            spec = (r.get("specialty") or "").strip()
+            if year is None or not spec:
+                continue
+            key = (year, spec)
+            by_specialty[key] = by_specialty.get(key, 0) + int(r.get("graduate_count") or 0)
+        aggregated = [{"year": y, "specialty": s, "graduate_count": c} for (y, s), c in by_specialty.items()]
+        if replace_years:
+            try:
+                supabase_client.table("yearly_graduates").delete().in_("year", replace_years).execute()
+            except Exception:
+                pass
+        specialty_map = _get_region_specialty_id_maps(supabase_client)[1]
+        inserted = 0
+        for r in aggregated:
             specialty_name = (r.get("specialty") or "").strip()
-            region_id = region_map.get(_normalize_name_for_lookup(region_name)) if region_name else None
             specialty_id = specialty_map.get(_normalize_name_for_lookup(specialty_name)) if specialty_name else None
             payload = {
                 "year": r["year"],
-                "region": region_name or r.get("region"),
                 "specialty": specialty_name or r.get("specialty"),
                 "graduate_count": r["graduate_count"],
                 "source_file_name": file_name,
                 "uploaded_at": datetime.utcnow().isoformat(),
             }
-            if region_id is not None:
-                payload["region_id"] = region_id
             if specialty_id is not None:
                 payload["specialty_id"] = specialty_id
             if session_id:
                 payload["session_id"] = session_id
             result = supabase_client.table("yearly_graduates").upsert(
                 payload,
-                on_conflict="year,region,specialty",
+                on_conflict="year,specialty_id",
             ).execute()
             if result.data:
                 inserted += 1
         return {
             "success": True,
             "inserted": inserted,
-            "total_rows": len(rows),
-            "metadata": {"columns_used": ["year", "region", "specialty", "graduate_count"]},
+            "total_rows": len(aggregated),
+            "metadata": {"columns_used": ["year", "region", "specialty", "graduate_count"], "aggregated_by": "specialty"},
         }
     except ValueError as e:
         return {"success": False, "error": str(e)}
@@ -448,10 +462,10 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
         session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
         session = session_resp.data[0] if session_resp.data else None
         graduate_year = (session.get("year") or datetime.now().year) - 1 if session else (datetime.now().year - 1)
-        graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
+        graduates_resp = supabase.table("yearly_graduates").select("specialty, graduate_count").eq("year", graduate_year).execute()
         graduates_map = {}
         for g in (graduates_resp.data or []):
-            key = _normalize_graduate_key(g.get("region"), g.get("specialty"))
+            key = _normalize_specialty_for_graduate_lookup(g.get("specialty"))
             graduates_map[key] = int(g.get("graduate_count") or 0)
         
         def _region_name(d):
@@ -476,7 +490,7 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
             suggestion = suggestions_map.get(demand['id'], {})
             region = _region_name(demand)
             specialty = _specialty_name(demand)
-            graduate_count = graduates_map.get(_normalize_graduate_key(region, specialty))
+            graduate_count = graduates_map.get(_normalize_specialty_for_graduate_lookup(specialty))
             review_data.append({
                 **demand,
                 'graduate_count': graduate_count,
@@ -533,10 +547,10 @@ async def get_full_review_table(session_id: str):
         session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
         session = session_resp.data[0] if session_resp.data else None
         graduate_year = (session.get("year") or datetime.now().year) - 1 if session else (datetime.now().year - 1)
-        graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
+        graduates_resp = supabase.table("yearly_graduates").select("specialty, graduate_count").eq("year", graduate_year).execute()
         graduates_map = {}
         for g in (graduates_resp.data or []):
-            key = _normalize_graduate_key(g.get("region"), g.get("specialty"))
+            key = _normalize_specialty_for_graduate_lookup(g.get("specialty"))
             graduates_map[key] = int(g.get("graduate_count") or 0)
         
         demands_resp = supabase.table("demand_requests").select(
@@ -563,7 +577,7 @@ async def get_full_review_table(session_id: str):
             suggestion = suggestions_map.get(demand['id'], {})
             region = _region_name(demand)
             specialty = _specialty_name(demand)
-            graduate_count = graduates_map.get(_normalize_graduate_key(region, specialty))
+            graduate_count = graduates_map.get(_normalize_specialty_for_graduate_lookup(specialty))
             review_data.append({
                 'id': demand['id'],
                 'region': demand.get('region'),
@@ -621,10 +635,10 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
             return {"status": "success", "message": "No demands to allocate", "updated": 0}
 
         graduate_year = (session.get("year") or datetime.now().year) - 1
-        graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
+        graduates_resp = supabase.table("yearly_graduates").select("specialty, graduate_count").eq("year", graduate_year).execute()
         graduates_map = {}
         for g in (graduates_resp.data or []):
-            key = _normalize_graduate_key(g.get("region"), g.get("specialty"))
+            key = _normalize_specialty_for_graduate_lookup(g.get("specialty"))
             graduates_map[key] = int(g.get("graduate_count") or 0)
 
         def _demand_region_name(d):
@@ -640,7 +654,7 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
             specialty = _demand_specialty_name(d)
             hist = int(d.get("historical_deficit") or 0)
             req = int(d.get("current_request") or 0)
-            grad = graduates_map.get(_normalize_graduate_key(region, specialty), 0)
+            grad = graduates_map.get(_normalize_specialty_for_graduate_lookup(specialty), 0)
             rows.append({
                 "id": d["id"],
                 "historical_deficit": hist,
@@ -1007,18 +1021,27 @@ async def upload_graduates(
     file: UploadFile = File(...),
     session_id: Optional[str] = None,
     year: Optional[int] = None,
+    years: Optional[str] = None,
     sheet_name: Optional[str] = None,
+    replace: bool = False,
 ):
     """
-    Upload Excel file with yearly graduate data.
+    Upload Excel file with yearly graduate data (stored per specialty only).
     Excel columns: region, specialty, graduate_count (or graduates/count). Optional: year (or pass ?year=2024).
-    Optional: session_id to link this data to an allocation session; sheet_name to read a specific sheet.
+    replace: if True, delete existing rows for the given year(s) before insert (re-import).
+    years: comma-separated years to replace when replace=1 (e.g. years=2024,2025,2026). If not set, uses year.
     """
     try:
         content = await file.read()
         ext = file.filename.lower().split(".")[-1]
         if ext not in ("xlsx", "xls"):
             raise HTTPException(status_code=400, detail="Only Excel (.xlsx, .xls) files are supported.")
+        replace_years = None
+        if replace:
+            if years:
+                replace_years = [int(y.strip()) for y in years.split(",") if y.strip().isdigit()]
+            elif year is not None:
+                replace_years = [year]
         result = await process_uploaded_graduates(
             content,
             supabase,
@@ -1026,6 +1049,7 @@ async def upload_graduates(
             default_year=year,
             file_name=file.filename,
             sheet_name=sheet_name,
+            replace_years=replace_years,
         )
         if not result.get("success"):
             raise HTTPException(status_code=400, detail=result.get("error", "Failed to process file"))
@@ -1050,7 +1074,7 @@ async def list_graduates(year: Optional[int] = None, session_id: Optional[str] =
     List yearly graduate records. Filter by year and/or session_id.
     """
     try:
-        query = supabase.table("yearly_graduates").select("*").order("year", desc=True).order("region").order("specialty")
+        query = supabase.table("yearly_graduates").select("*").order("year", desc=True).order("specialty")
         if year is not None:
             query = query.eq("year", year)
         if session_id is not None:
