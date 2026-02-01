@@ -585,8 +585,6 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
             raise HTTPException(status_code=404, detail="Session not found")
         session = session_resp.data[0]
         total_grants = request.total_grants if request.total_grants is not None else session.get("total_budget") or 0
-        if total_grants <= 0:
-            raise HTTPException(status_code=400, detail="total_grants or session.total_budget must be positive")
 
         demands_resp = supabase.table("demand_requests").select(
             "*, region:regions(id, name), specialty:specialties(id, name)"
