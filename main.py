@@ -95,6 +95,168 @@ def allocation_by_priority(priority: str, rows: List[dict]) -> List[int]:
     return result
 
 
+# --- Geographic University Allocation ---
+
+import math
+
+# Approximate centroids for Kazakhstan regions/cities (lat, lng) for distance ordering.
+# Names normalized for lookup: lowercase, no "г." / "область".
+REGION_CENTROIDS = {
+    "алматы": (43.238949, 76.945465),
+    "астана": (51.160522, 71.470355),
+    "шымкент": (42.341686, 69.590101),
+    "акмолинская": (51.916667, 69.416667),
+    "актюбинская": (50.283333, 57.166667),
+    "алматинская": (45.016667, 78.383333),
+    "атырауская": (47.116667, 51.916667),
+    "восточно-казахстанская": (49.95, 82.616667),
+    "жамбылская": (43.333333, 71.25),
+    "западно-казахстанская": (50.25, 51.366667),
+    "карагандинская": (47.8, 71.95),
+    "костанайская": (53.216667, 63.633333),
+    "кызылординская": (44.85, 65.516667),
+    "мангистауская": (43.65, 51.15),
+    "павлодарская": (52.283333, 76.95),
+    "северо-казахстанская": (54.866667, 69.15),
+    "туркестанская": (43.3, 68.25),
+    "улытауская": (47.7, 66.9),
+    "абай": (49.633333, 80.0),
+    "жуалынский": (42.9, 70.9),
+    "улытау": (47.7, 66.9),
+    "жетысу": (45.5, 79.5),
+}
+
+
+def _normalize_region_for_centroid(name: str) -> str:
+    """Normalize region name for centroid lookup."""
+    if not name:
+        return ""
+    s = (name or "").strip().lower()
+    for prefix in ("г.", "город ", "обл.", "область "):
+        if s.startswith(prefix):
+            s = s[len(prefix) :].strip()
+    return s.replace("  ", " ").strip()
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance in km between two (lat, lon) points."""
+    R = 6371.0  # Earth radius km
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def _compute_geo_university_allocations(supabase_client) -> List[dict]:
+    """
+    For each (region, specialty) demand, greedily assign grants to the closest universities
+    (same region first, then by haversine distance). Respects university_specialty_capacity.
+    Returns list of { region_id, specialty_id, university_id, allocated_count }.
+    """
+    # Fetch demands: region_id, specialty_id, amount (initial_allocation or user_allocation)
+    demands_resp = supabase_client.table("demand_requests").select(
+        "id, region_id, specialty_id, initial_allocation, user_allocation"
+    ).execute()
+    demands_raw = demands_resp.data or []
+    # Resolve region names for centroid lookup
+    region_ids = list({d["region_id"] for d in demands_raw if d.get("region_id")})
+    region_names_by_id = {}
+    if region_ids:
+        regions_resp = supabase_client.table("regions").select("id, name").in_("id", region_ids).execute()
+        for r in (regions_resp.data or []):
+            region_names_by_id[r["id"]] = (r.get("name") or "").strip()
+
+    demands = []
+    for d in demands_raw:
+        rid, sid = d.get("region_id"), d.get("specialty_id")
+        if not rid or not sid:
+            continue
+        amount = d.get("user_allocation")
+        if amount is None:
+            amount = d.get("initial_allocation") or 0
+        amount = max(0, int(amount))
+        if amount <= 0:
+            continue
+        demands.append({
+            "region_id": rid,
+            "specialty_id": sid,
+            "region_name": region_names_by_id.get(rid) or "",
+            "amount": amount,
+        })
+
+    # Universities: id, region_id, lat, lng
+    unis_resp = supabase_client.table("universities").select("id, region_id, lat, lng").execute()
+    universities = {u["id"]: u for u in (unis_resp.data or [])}
+
+    # Capacity per (university_id, specialty_id)
+    cap_resp = supabase_client.table("university_specialty_capacity").select(
+        "university_id, specialty_id, capacity"
+    ).execute()
+    # remaining_capacity[(uni_id, spec_id)] = int
+    remaining_capacity = {}
+    for row in cap_resp.data or []:
+        uid, sid, cap = row.get("university_id"), row.get("specialty_id"), int(row.get("capacity") or 0)
+        if uid and sid and cap > 0:
+            remaining_capacity[(str(uid), str(sid))] = cap
+
+    assignments = []
+
+    for d in demands:
+        region_id = d["region_id"]
+        specialty_id = d["specialty_id"]
+        region_name = d["region_name"]
+        amount_left = d["amount"]
+
+        # Universities that have capacity for this specialty
+        candidates = []
+        for (uid, sid), cap in remaining_capacity.items():
+            if sid != specialty_id or cap <= 0:
+                continue
+            u = universities.get(uid)
+            if not u:
+                continue
+            candidates.append((uid, cap, u))
+
+        if not candidates:
+            continue
+
+        # Region centroid for distance
+        centroid = REGION_CENTROIDS.get(_normalize_region_for_centroid(region_name))
+
+        def sort_key(item):
+            uid, cap, u = item
+            same_region = 0 if str(u.get("region_id") or "") == str(region_id) else 1
+            u_lat, u_lng = u.get("lat"), u.get("lng")
+            if centroid and u_lat is not None and u_lng is not None:
+                dist_km = _haversine_km(centroid[0], centroid[1], float(u_lat), float(u_lng))
+            else:
+                dist_km = 9999.0 if same_region else 10000.0
+            return (same_region, dist_km, -cap)  # same region first, then by distance, then prefer larger capacity
+
+        candidates.sort(key=sort_key)
+
+        for uid, cap, u in candidates:
+            if amount_left <= 0:
+                break
+            key = (str(uid), str(specialty_id))
+            available = remaining_capacity.get(key, 0)
+            take = min(amount_left, available)
+            if take <= 0:
+                continue
+            remaining_capacity[key] = available - take
+            amount_left -= take
+            assignments.append({
+                "region_id": region_id,
+                "specialty_id": specialty_id,
+                "university_id": uid,
+                "allocated_count": take,
+            })
+
+    return assignments
+
+
 # --- Excel Parser Helper ---
 import asyncio
 import io
@@ -123,6 +285,54 @@ def _normalize_header(h):
     return s
 
 
+def _parse_regional_sheet_graduates(wb, sheet_name, default_year):
+    """
+    Parse regional breakdown sheet (no header row).
+    Expected: col 0 = number (specialty block), col 1 = specialty name, col 2 = region, col 3 = deficit, col 4 = request, col 5 = graduate_count.
+    Returns list of { year, region, specialty, graduate_count } or None if sheet is wrong/empty.
+    """
+    try:
+        ws = wb[sheet_name]
+    except Exception:
+        return None
+    current_specialty = None
+    skip_headers = ("емкость вуза, нии", "заявки регионов", "дефицит по рк", "регион", "область", "region", "специальность", "specialty")
+    rows_out = []
+    for row in ws.iter_rows(min_row=1, values_only=True):
+        if not row or len(row) < 6:
+            continue
+        # First cell numeric => specialty header row
+        try:
+            v0 = row[0]
+            if v0 is not None and str(v0).strip() != "":
+                n = float(v0) if not isinstance(v0, (int, float)) else v0
+                if isinstance(n, (int, float)) and (isinstance(n, int) or n == int(n)):
+                    current_specialty = (row[1] or "").strip() if len(row) > 1 else None
+                    if current_specialty:
+                        continue
+        except (ValueError, TypeError):
+            pass
+        region_raw = (row[2] or "").strip() if len(row) > 2 else ""
+        region = str(region_raw).strip()
+        if not region or region.lower() in skip_headers:
+            continue
+        if not current_specialty:
+            continue
+        try:
+            cnt = int(float(row[5])) if len(row) > 5 and row[5] is not None else 0
+        except (TypeError, ValueError):
+            cnt = 0
+        if cnt < 0:
+            cnt = 0
+        rows_out.append({
+            "year": default_year,
+            "region": region,
+            "specialty": current_specialty,
+            "graduate_count": cnt,
+        })
+    return rows_out if rows_out else None
+
+
 def parse_excel_graduates(file_content, sheet_name=None, default_year=None):
     """
     Parse Excel file and extract yearly graduate data.
@@ -146,12 +356,19 @@ def parse_excel_graduates(file_content, sheet_name=None, default_year=None):
             region_col = i
         elif h in ("specialty", "speciality", "специальность", "specialty_name"):
             specialty_col = i
-        elif h in ("graduate_count", "graduates", "count", "количество", "number", "num"):
+        elif h in ("graduate_count", "graduates", "count", "количество", "number", "num", "выпуск"):
             count_col = i
     if region_col is None or specialty_col is None or count_col is None:
+        # Fallback: try sheets as regional breakdown (no header, columns: 0=num, 1=specialty, 2=region, 5=graduate_count)
+        if default_year is not None and wb.sheetnames:
+            for name in (wb.sheetnames[1:2] + wb.sheetnames[0:1]):  # try sheet 2 first, then sheet 1
+                fallback = _parse_regional_sheet_graduates(wb, name, default_year)
+                if fallback:
+                    return fallback
         raise ValueError(
             "Excel must have columns for region, specialty, and graduate count. "
-            "Accepted names: region/Region, specialty/Specialty, graduate_count/graduates/count."
+            "Accepted names: region/Region, specialty/Specialty, graduate_count/graduates/count/Выпуск. "
+            "Or use the second sheet as regional breakdown (columns: specialty, region, ..., graduate count in col 6)."
         )
     rows = []
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -1090,13 +1307,56 @@ async def list_graduates(year: Optional[int] = None, session_id: Optional[str] =
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/university-allocations/geo")
+async def compute_geo_university_allocations(save: bool = False):
+    """
+    Compute university allocations by geography: for each (region, specialty) demand,
+    greedily assign grants to the closest universities (same region first, then by
+    haversine distance from region centroid). Respects university_specialty_capacity.
+    Returns the list of assignments. If save=true, upserts into university_allocation_assignments.
+    """
+    try:
+        assignments = _compute_geo_university_allocations(supabase)
+        if save and assignments:
+            try:
+                # Delete existing geo assignments for (region, specialty) pairs we're recomputing
+                region_spec_pairs = set((a["region_id"], a["specialty_id"]) for a in assignments)
+                for rid, sid in region_spec_pairs:
+                    supabase.table("university_allocation_assignments").delete().eq("region_id", rid).eq("specialty_id", sid).execute()
+                for a in assignments:
+                    supabase.table("university_allocation_assignments").insert({
+                        "region_id": a["region_id"],
+                        "specialty_id": a["specialty_id"],
+                        "university_id": a["university_id"],
+                        "allocated_count": a["allocated_count"],
+                    }).execute()
+            except Exception as persist_e:
+                return {
+                    "status": "success",
+                    "assignments": assignments,
+                    "count": len(assignments),
+                    "persisted": False,
+                    "persist_error": str(persist_e),
+                }
+        return {
+            "status": "success",
+            "assignments": assignments,
+            "count": len(assignments),
+            "persisted": save and bool(assignments),
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
         "service": "allocation-api-v3",
         "version": "3.0",
-        "features": ["excel_upload", "pdf_upload", "regional_allocation", "yearly_graduates"]
+        "features": ["excel_upload", "pdf_upload", "regional_allocation", "yearly_graduates", "geo_university_allocation"]
     }
 
 
