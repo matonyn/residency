@@ -66,49 +66,33 @@ class RunAllocationRequest(BaseModel):
     total_grants: Optional[int] = None  # default: session.total_budget
 
 
-# --- Allocation Logic (matches frontend) ---
+# --- Allocation Logic ---
 
 ALLOCATION_PRIORITIES = ("historic_deficit", "requested_amount", "last_year_data")
-WEIGHTS = {
-    "historic_deficit": {"d": 0.7, "r": 0.15, "g": 0.15},
-    "requested_amount": {"d": 0.15, "r": 0.7, "g": 0.15},
-    "last_year_data": {"d": 0.15, "r": 0.15, "g": 0.7},
-}
 
 
-def compute_weighted_allocation(total_grants: int, priority: str, rows: List[dict]) -> List[int]:
+def allocation_by_priority(priority: str, rows: List[dict]) -> List[int]:
     """
-    Distribute total_grants across rows by weighted score.
-    Each row has historical_deficit, current_request, graduate_count.
-    Returns list of allocated quotas (same order as rows).
+    Set initial allocation to the value of the chosen priority per row.
+    No distribution: historic_deficit -> historical_deficit, requested_amount -> current_request, last_year_data -> graduate_count.
+    Returns list of allocations (same order as rows).
     """
     if not rows:
         return []
-    w = WEIGHTS.get(priority, WEIGHTS["historic_deficit"])
-    scores = []
+    result = []
     for r in rows:
         d = max(0, int(r.get("historical_deficit") or 0))
         req = max(0, int(r.get("current_request") or 0))
         g = max(0, int(r.get("graduate_count") or 0))
-        scores.append(w["d"] * d + w["r"] * req + w["g"] * g)
-    total_score = sum(scores)
-    if total_score <= 0:
-        per_row = total_grants // len(rows)
-        remainder = total_grants - per_row * len(rows)
-        return [per_row + (1 if i < remainder else 0) for i in range(len(rows))]
-    quotas = []
-    allocated = 0
-    for s in scores:
-        q = int((total_grants * s) / total_score)
-        quotas.append(q)
-        allocated += q
-    remainder = total_grants - allocated
-    # Sort by fractional part descending to assign remainder
-    fracs = [(i, (total_grants * scores[i]) / total_score - int((total_grants * scores[i]) / total_score)) for i in range(len(scores))]
-    fracs.sort(key=lambda x: -x[1])
-    for k in range(remainder):
-        quotas[fracs[k][0]] += 1
-    return quotas
+        if priority == "historic_deficit":
+            result.append(d)
+        elif priority == "requested_amount":
+            result.append(req)
+        elif priority == "last_year_data":
+            result.append(g)
+        else:
+            result.append(max(d, req))
+    return result
 
 
 # --- Excel Parser Helper ---
@@ -258,11 +242,11 @@ async def process_uploaded_excel(content, session_id, supabase):
                 inserted += 1
                 dr_id = resp.data[0]["id"]
                 max_need = max(hist, req)
-                # Highlight: under-allocated (red) or can_reduce (yellow). Schema allows only can_reduce, over_allocated, under_allocated, priority_low.
-                if initial_allocation < max_need:
-                    suggestion_data = {"demand_request_id": dr_id, "suggestion_type": "under_allocated", "suggested_reduction": 0, "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})", "highlight_color": "red"}
-                elif initial_allocation > max_need:
-                    suggestion_data = {"demand_request_id": dr_id, "suggestion_type": "can_reduce", "suggested_reduction": initial_allocation - max_need, "reason": f"Можно уменьшить на {initial_allocation - max_need}", "highlight_color": "yellow"}
+                # Highlight: red = allocation could be less (over-allocated), yellow = allocation could be higher (under-allocated)
+                if initial_allocation > max_need:
+                    suggestion_data = {"demand_request_id": dr_id, "suggestion_type": "can_reduce", "suggested_reduction": initial_allocation - max_need, "reason": f"Можно уменьшить на {initial_allocation - max_need}", "highlight_color": "red"}
+                elif initial_allocation < max_need:
+                    suggestion_data = {"demand_request_id": dr_id, "suggestion_type": "under_allocated", "suggested_reduction": 0, "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})", "highlight_color": "yellow"}
                 else:
                     suggestion_data = None
                 if suggestion_data:
@@ -559,7 +543,7 @@ async def get_full_review_table(session_id: str):
                 'specialty': demand.get('specialty'),
                 'historical_deficit': demand['historical_deficit'],
                 'current_request': demand['current_request'],
-                'max_need': demand['historical_deficit'] + demand['current_request'],
+                'max_need': max(demand.get('historical_deficit') or 0, demand.get('current_request') or 0),
                 'graduate_count': graduate_count,
                 'graduate_year': graduate_year,
                 'initial_allocation': demand.get('initial_allocation', 0),
@@ -589,9 +573,10 @@ async def get_full_review_table(session_id: str):
 @app.post("/sessions/{session_id}/run-allocation")
 async def run_allocation(session_id: str, request: RunAllocationRequest):
     """
-    Run weighted allocation for the session.
-    Default allocation per row = max(historical_deficit, current_request).
-    With priority: distribute total_grants (or session.total_budget) by weights (70% chosen factor, 15% others).
+    Set initial allocations by the chosen priority (no distribution).
+    historic_deficit -> initial_allocation = historical_deficit per row.
+    requested_amount -> initial_allocation = current_request per row.
+    last_year_data -> initial_allocation = graduate_count per row.
     Updates demand_requests.initial_allocation and adjustment_suggestions (red/yellow highlight).
     """
     try:
@@ -638,7 +623,7 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
                 "graduate_count": grad,
             })
 
-        quotas = compute_weighted_allocation(total_grants, request.priority, rows)
+        quotas = allocation_by_priority(request.priority, rows)
         if len(quotas) != len(demands):
             raise HTTPException(status_code=500, detail="Allocation length mismatch")
 
@@ -655,20 +640,21 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
             hist = int(demand.get("historical_deficit") or 0)
             req = int(demand.get("current_request") or 0)
             max_need = max(hist, req)
-            if initial_allocation < max_need:
-                supabase.table("adjustment_suggestions").insert({
-                    "demand_request_id": demand["id"],
-                    "suggestion_type": "under_allocated",
-                    "suggested_reduction": 0,
-                    "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})",
-                    "highlight_color": "red",
-                }).execute()
-            elif initial_allocation > max_need:
+            # Red = allocation could be less (over-allocated). Yellow = allocation could be higher (under-allocated).
+            if initial_allocation > max_need:
                 supabase.table("adjustment_suggestions").insert({
                     "demand_request_id": demand["id"],
                     "suggestion_type": "can_reduce",
                     "suggested_reduction": initial_allocation - max_need,
                     "reason": f"Можно уменьшить на {initial_allocation - max_need}",
+                    "highlight_color": "red",
+                }).execute()
+            elif initial_allocation < max_need:
+                supabase.table("adjustment_suggestions").insert({
+                    "demand_request_id": demand["id"],
+                    "suggestion_type": "under_allocated",
+                    "suggested_reduction": 0,
+                    "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})",
                     "highlight_color": "yellow",
                 }).execute()
 
@@ -936,7 +922,7 @@ async def export_session(session_id: str, format: str = "json"):
                 "specialty": d['specialty'],
                 "historical_deficit": d['historical_deficit'],
                 "current_request": d['current_request'],
-                "max_need": d['historical_deficit'] + d['current_request'],
+                "max_need": max(d.get('historical_deficit') or 0, d.get('current_request') or 0),
                 "initial_allocation": d.get('initial_allocation', 0),
                 "final_allocation": d.get('user_allocation') or d.get('initial_allocation', 0),
                 "deduction": d.get('initial_allocation', 0) - (d.get('user_allocation') or d.get('initial_allocation', 0)),
