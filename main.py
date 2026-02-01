@@ -184,8 +184,20 @@ def parse_excel_graduates(file_content, sheet_name=None, default_year=None):
         })
     return rows
 
+def _normalize_name_for_lookup(name):
+    """Normalize name for case-insensitive lookup: strip and lowercase."""
+    return (name or "").strip().lower()
+
+
+def _normalize_graduate_key(region_name, specialty_name):
+    """Normalize region|specialty for matching (strip, lowercase, strip 'г.' prefix)."""
+    r = (region_name or "").strip().lower().replace("г.", "").strip()
+    s = (specialty_name or "").strip().lower()
+    return f"{r}|{s}"
+
+
 def _get_region_specialty_id_maps(supabase_client):
-    """Fetch regions and specialties from DB; return (region_name -> id, specialty_name -> id) for FK resolution."""
+    """Fetch regions and specialties from DB; return (normalized_name -> id) for FK resolution (case-insensitive)."""
     region_map = {}
     specialty_map = {}
     try:
@@ -193,12 +205,12 @@ def _get_region_specialty_id_maps(supabase_client):
         for r in (regions_resp.data or []):
             name = (r.get("name") or "").strip()
             if name:
-                region_map[name] = r.get("id")
+                region_map[_normalize_name_for_lookup(name)] = r.get("id")
         specialties_resp = supabase_client.table("specialties").select("id, name").execute()
         for s in (specialties_resp.data or []):
             name = (s.get("name") or "").strip()
             if name:
-                specialty_map[name] = s.get("id")
+                specialty_map[_normalize_name_for_lookup(name)] = s.get("id")
     except Exception:
         pass
     return region_map, specialty_map
@@ -224,8 +236,8 @@ async def process_uploaded_excel(content, session_id, supabase):
             initial_allocation = int(initial) if initial is not None else max(hist, req)
             region_name = (d.get("region") or d.get("Region") or "").strip() or None
             specialty_name = (d.get("specialty") or d.get("Specialty") or "").strip() or None
-            region_id = region_map.get(region_name) if region_name else None
-            specialty_id = specialty_map.get(specialty_name) if specialty_name else None
+            region_id = region_map.get(_normalize_name_for_lookup(region_name)) if region_name else None
+            specialty_id = specialty_map.get(_normalize_name_for_lookup(specialty_name)) if specialty_name else None
             demand_data = {
                 "session_id": session_id,
                 "historical_deficit": hist,
@@ -265,6 +277,7 @@ async def process_uploaded_excel(content, session_id, supabase):
 async def process_uploaded_graduates(content, supabase_client, session_id=None, default_year=None, file_name=None, sheet_name=None):
     """
     Process uploaded Excel file with graduate data and upsert into yearly_graduates.
+    Resolves region/specialty names to region_id/specialty_id so frontend can match by ID.
     default_year: used when Excel has no year column.
     sheet_name: optional sheet name (e.g. "Graduates"); else first sheet.
     """
@@ -272,16 +285,25 @@ async def process_uploaded_graduates(content, supabase_client, session_id=None, 
         rows = parse_excel_graduates(content, sheet_name=sheet_name, default_year=default_year)
         if not rows:
             return {"success": True, "inserted": 0, "updated": 0, "message": "No rows to import"}
+        region_map, specialty_map = _get_region_specialty_id_maps(supabase_client)
         inserted = 0
         for r in rows:
+            region_name = (r.get("region") or "").strip()
+            specialty_name = (r.get("specialty") or "").strip()
+            region_id = region_map.get(_normalize_name_for_lookup(region_name)) if region_name else None
+            specialty_id = specialty_map.get(_normalize_name_for_lookup(specialty_name)) if specialty_name else None
             payload = {
                 "year": r["year"],
-                "region": r["region"],
-                "specialty": r["specialty"],
+                "region": region_name or r.get("region"),
+                "specialty": specialty_name or r.get("specialty"),
                 "graduate_count": r["graduate_count"],
                 "source_file_name": file_name,
                 "uploaded_at": datetime.utcnow().isoformat(),
             }
+            if region_id is not None:
+                payload["region_id"] = region_id
+            if specialty_id is not None:
+                payload["specialty_id"] = specialty_id
             if session_id:
                 payload["session_id"] = session_id
             result = supabase_client.table("yearly_graduates").upsert(
@@ -424,7 +446,7 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
         graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
         graduates_map = {}
         for g in (graduates_resp.data or []):
-            key = f"{g.get('region')}|{g.get('specialty')}"
+            key = _normalize_graduate_key(g.get("region"), g.get("specialty"))
             graduates_map[key] = int(g.get("graduate_count") or 0)
         
         def _region_name(d):
@@ -449,7 +471,7 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
             suggestion = suggestions_map.get(demand['id'], {})
             region = _region_name(demand)
             specialty = _specialty_name(demand)
-            graduate_count = graduates_map.get(f"{region}|{specialty}")
+            graduate_count = graduates_map.get(_normalize_graduate_key(region, specialty))
             review_data.append({
                 **demand,
                 'graduate_count': graduate_count,
@@ -509,7 +531,7 @@ async def get_full_review_table(session_id: str):
         graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
         graduates_map = {}
         for g in (graduates_resp.data or []):
-            key = f"{g.get('region')}|{g.get('specialty')}"
+            key = _normalize_graduate_key(g.get("region"), g.get("specialty"))
             graduates_map[key] = int(g.get("graduate_count") or 0)
         
         demands_resp = supabase.table("demand_requests").select(
@@ -536,7 +558,7 @@ async def get_full_review_table(session_id: str):
             suggestion = suggestions_map.get(demand['id'], {})
             region = _region_name(demand)
             specialty = _specialty_name(demand)
-            graduate_count = graduates_map.get(f"{region}|{specialty}")
+            graduate_count = graduates_map.get(_normalize_graduate_key(region, specialty))
             review_data.append({
                 'id': demand['id'],
                 'region': demand.get('region'),
@@ -597,7 +619,7 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
         graduates_resp = supabase.table("yearly_graduates").select("region, specialty, graduate_count").eq("year", graduate_year).execute()
         graduates_map = {}
         for g in (graduates_resp.data or []):
-            key = f"{g.get('region')}|{g.get('specialty')}"
+            key = _normalize_graduate_key(g.get("region"), g.get("specialty"))
             graduates_map[key] = int(g.get("graduate_count") or 0)
 
         def _demand_region_name(d):
@@ -613,7 +635,7 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
             specialty = _demand_specialty_name(d)
             hist = int(d.get("historical_deficit") or 0)
             req = int(d.get("current_request") or 0)
-            grad = graduates_map.get(f"{region}|{specialty}", 0)
+            grad = graduates_map.get(_normalize_graduate_key(region, specialty), 0)
             rows.append({
                 "id": d["id"],
                 "historical_deficit": hist,
