@@ -185,8 +185,13 @@ def parse_excel_graduates(file_content, sheet_name=None, default_year=None):
     return rows
 
 def _normalize_name_for_lookup(name):
-    """Normalize name for case-insensitive lookup: strip and lowercase."""
-    return (name or "").strip().lower()
+    """Normalize name for case-insensitive lookup: strip, lowercase, strip 'г.'/'город' prefix, collapse spaces."""
+    import re
+    s = (name or "").strip().lower()
+    s = re.sub(r"^\s*г\.\s*", "", s)
+    s = re.sub(r"^\s*город\s*", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def _normalize_graduate_key(region_name, specialty_name):
