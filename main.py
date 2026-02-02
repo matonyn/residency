@@ -114,6 +114,7 @@ def allocation_by_priority(priority: str, rows: List[dict]) -> List[int]:
 
 
 # --- Geographic University Allocation (hardcoded proximity by region grouping) ---
+# --- Geographic University Allocation (Graph-Based / Edge-Centric) ---
 
 def _compute_geo_university_allocations(
     supabase_client,
@@ -121,14 +122,16 @@ def _compute_geo_university_allocations(
 ) -> List[dict]:
     """
     Graph-Based Greedy Allocation.
-    1. Builds a graph of Universities -> Regions with Priority weights.
-    2. Fetches Supply (Uni Capacity) and Demand (Region Requests).
-    3. Sorts all connections by Priority (Primary > Secondary > Tertiary > Specialized).
-    4. Greedily flows graduates to regions based on this sorted order.
+    Instead of iterating demands (which allows secondary regions to 'steal' capacity if processed first),
+    we iterate *Relationships* (Edges) sorted by global priority.
+    
+    1. Primary Edges (Rank 1) are processed for the WHOLE country first.
+    2. Secondary Edges (Rank 2) next.
+    3. Tertiary/National (Rank 3) last.
     """
     
     # --- 1. Fetch Supply (University Capacity) ---
-    # capacity_map: {(uni_id, spec_id) -> int_capacity}
+    # supply_map: {(uni_id, spec_id) -> int_capacity}
     cap_resp = supabase_client.table("university_specialty_capacity").select(
         "university_id, specialty_id, capacity"
     ).execute()
@@ -142,7 +145,6 @@ def _compute_geo_university_allocations(
 
     # --- 2. Fetch Demand (Region Requests) ---
     # demand_map: {(region_id, spec_id) -> int_amount_needed}
-    # demand_ids_map: {(region_id, spec_id) -> demand_request_id} (optional, for tracking)
     demands_resp = supabase_client.table("demand_requests").select(
         "id, region_id, specialty_id, initial_allocation, user_allocation"
     ).execute()
@@ -157,7 +159,7 @@ def _compute_geo_university_allocations(
 
     for d in raw_demands:
         rid, sid = str(d.get("region_id")), str(d.get("specialty_id"))
-        # Use user_allocation if set, otherwise initial. Max ensures no negatives.
+        # Use user_allocation if set, otherwise initial.
         amt = d.get("user_allocation")
         if amt is None:
             amt = d.get("initial_allocation") or 0
@@ -166,95 +168,95 @@ def _compute_geo_university_allocations(
         if amt > 0:
             demand_map[(rid, sid)] = amt
 
-    # --- 3. Build region -> [(university_id, priority_rank)] per region ---
-    # So for each region we know which universities serve it and in what order (primary first).
+    # --- 3. Build the Graph Edges (The Network) ---
+    # We fetch ALL edges to ensure we know every valid route from Uni -> Region
     prox_resp = supabase_client.table("university_region_proximity").select(
         "university_id, region_id, priority"
     ).execute()
     
     priority_rank = {
-        "primary": 1,
+        "primary": 1,      # Process these First (High Priority)
         "secondary": 2,
         "tertiary": 3,
-        "specialized": 4,
+        "specialized": 4
     }
-    # region_id -> list of (university_id, rank) sorted by rank
-    region_universities: dict = {}
+    
+    # Edges = list of { u: uni_id, r: region_id, rank: 1-4 }
+    edges = []
     for row in (prox_resp.data or []):
         uid = str(row.get("university_id"))
         rid = str(row.get("region_id"))
         p_str = (row.get("priority") or "").strip().lower()
-        rank = priority_rank.get(p_str, 99)
-        if rid not in region_universities:
-            region_universities[rid] = []
-        region_universities[rid].append((uid, rank))
-    for rid in region_universities:
-        region_universities[rid].sort(key=lambda x: (x[1], x[0]))
+        rank = priority_rank.get(p_str, 99) # 99 = unknown/lowest
+        
+        edges.append({
+            "u": uid,
+            "r": rid,
+            "rank": rank
+        })
 
-    # --- 4. Demand-first allocation ---
-    # For each (region, specialty) demand, try universities in priority order FOR THAT REGION.
-    # This ensures every region gets primary providers first, then backup; no region is starved
-    # because we processed another region's primary edges first.
+    # --- 4. The Waterfall (Greedy Global Sort) ---
+    # CRITICAL STEP: Sort by Rank. 
+    # This guarantees we fill ALL Primary needs in the country before touching Secondary needs.
+    edges.sort(key=lambda x: x["rank"])
+    
     assignments = []
-    demand_keys = list(demand_map.keys())
-    for (rid, sid) in demand_keys:
-        needed = demand_map.get((rid, sid), 0)
-        if needed <= 0:
-            continue
-        unis_for_region = region_universities.get(rid, [])
-        for uid, _rank in unis_for_region:
+    
+    # Iterate through every valid connection in strict priority order
+    for edge in edges:
+        uid = edge["u"]
+        rid = edge["r"]
+        
+        # Optimization: We only care about specialties that THIS Uni has capacity for
+        # AND THIS Region has demand for.
+        
+        # 1. Get specialties this uni has
+        # (In a larger system, you'd index this, but for <50 unis/specs, iteration is fast)
+        uni_specs = [s for (u, s) in supply_map.keys() if u == uid and supply_map[(u,s)] > 0]
+        
+        for sid in uni_specs:
+            # 2. Check if the region needs it
+            needed = demand_map.get((rid, sid), 0)
             if needed <= 0:
-                break
+                continue
+            
+            # 3. Check capacity
             available = supply_map.get((uid, sid), 0)
             if available <= 0:
                 continue
+                
+            # 4. Allocate
             flow = min(needed, available)
+            
             assignments.append({
                 "region_id": rid,
                 "specialty_id": sid,
                 "university_id": uid,
-                "allocated_count": flow,
+                "allocated_count": flow
             })
+            
+            # 5. Update State (Reduce Supply & Demand)
             supply_map[(uid, sid)] = available - flow
-            needed -= flow
-        demand_map[(rid, sid)] = needed
+            demand_map[(rid, sid)] = needed - flow
 
-    # Fallback: for any (region, specialty) still with demand > 0 (e.g. no proximity rows),
-    # try any university that has capacity for that specialty.
-    remaining_demand = [(rid, sid) for (rid, sid) in demand_map if demand_map[(rid, sid)] > 0]
-    if remaining_demand:
-        all_unis = sorted(set(u for (u, _) in supply_map.keys()))
-        for (rid, sid) in remaining_demand:
-            needed = demand_map.get((rid, sid), 0)
-            if needed <= 0:
-                continue
-            for uid in all_unis:
-                if needed <= 0:
-                    break
-                available = supply_map.get((uid, sid), 0)
-                if available <= 0:
-                    continue
-                flow = min(needed, available)
-                assignments.append({
-                    "region_id": rid,
-                    "specialty_id": sid,
-                    "university_id": uid,
-                    "allocated_count": flow,
-                })
-                supply_map[(uid, sid)] = available - flow
-                needed -= flow
-            demand_map[(rid, sid)] = needed
-
+    # --- 5. Consolidate and Return ---
+    # (Merge multiple assignments if duplicate edges existed)
     consolidated = {}
     for a in assignments:
         key = (a["region_id"], a["specialty_id"], a["university_id"])
         consolidated[key] = consolidated.get(key, 0) + a["allocated_count"]
-    final_output = [
-        {"region_id": rid, "specialty_id": sid, "university_id": uid, "allocated_count": count}
-        for (rid, sid, uid), count in consolidated.items()
-    ]
+        
+    final_output = []
+    for (rid, sid, uid), count in consolidated.items():
+        if count > 0:
+            final_output.append({
+                "region_id": rid,
+                "specialty_id": sid,
+                "university_id": uid,
+                "allocated_count": count
+            })
+            
     return final_output
-
 
 # --- Excel Parser Helper ---
 import asyncio
