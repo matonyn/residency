@@ -5,7 +5,7 @@ Supports both Excel (.xlsx) and PDF uploads
 
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Literal, Set, Tuple
 import sys
 
@@ -120,109 +120,150 @@ def _compute_geo_university_allocations(
     demand_filter: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[dict]:
     """
-    For each (region, specialty) demand, greedily assign grants to universities
-    using hardcoded proximity: university_region_proximity table groups which regions
-    each university "serves". Universities proximate to the demand region come first.
-    Respects university_specialty_capacity.
-    If demand_filter is set, only process demands for (region_id, specialty_id) in that set.
-    Returns list of { region_id, specialty_id, university_id, allocated_count }.
+    Graph-Based Greedy Allocation.
+    1. Builds a graph of Universities -> Regions with Priority weights.
+    2. Fetches Supply (Uni Capacity) and Demand (Region Requests).
+    3. Sorts all connections by Priority (Primary > Secondary > Tertiary > Specialized).
+    4. Greedily flows graduates to regions based on this sorted order.
     """
-    demands_resp = supabase_client.table("demand_requests").select(
-        "id, region_id, specialty_id, initial_allocation, user_allocation"
-    ).execute()
-    demands_raw = demands_resp.data or []
-    if demand_filter is not None:
-        demand_filter_str = {(str(r), str(s)) for r, s in demand_filter}
-        demands_raw = [d for d in demands_raw if (str(d.get("region_id")), str(d.get("specialty_id"))) in demand_filter_str]
-    region_ids = list({d["region_id"] for d in demands_raw if d.get("region_id")})
-
-    # Priority: (region_id, university_id) -> priority (primary=0, secondary=1, tertiary=2, specialized=3)
-    priority_order = {"primary": 0, "secondary": 1, "tertiary": 2, "specialized": 3}
-    region_uni_priority = {}  # (rid_str, uid_str) -> 0..3
-    try:
-        prox_resp = supabase_client.table("university_region_proximity").select(
-            "region_id, university_id, priority"
-        ).in_("region_id", region_ids).execute()
-        for row in (prox_resp.data or []):
-            rid, uid = str(row.get("region_id")), str(row.get("university_id"))
-            pri = (row.get("priority") or "").strip().lower()
-            if rid and uid and pri in priority_order:
-                region_uni_priority[(rid, uid)] = priority_order[pri]
-    except Exception:
-        pass
-
-    demands = []
-    for d in demands_raw:
-        rid, sid = d.get("region_id"), d.get("specialty_id")
-        if not rid or not sid:
-            continue
-        amount = d.get("user_allocation")
-        if amount is None:
-            amount = d.get("initial_allocation") or 0
-        amount = max(0, int(amount))
-        if amount <= 0:
-            continue
-        demands.append({"region_id": str(rid), "specialty_id": str(sid), "amount": amount})
-
-    unis_resp = supabase_client.table("universities").select("id, region_id").execute()
-    universities = {u["id"]: u for u in (unis_resp.data or [])}
-
+    
+    # --- 1. Fetch Supply (University Capacity) ---
+    # capacity_map: {(uni_id, spec_id) -> int_capacity}
     cap_resp = supabase_client.table("university_specialty_capacity").select(
         "university_id, specialty_id, capacity"
     ).execute()
-    remaining_capacity = {}
-    for row in cap_resp.data or []:
-        uid, sid, cap = row.get("university_id"), row.get("specialty_id"), int(row.get("capacity") or 0)
-        if uid and sid and cap > 0:
-            remaining_capacity[(str(uid), str(sid))] = cap
+    
+    supply_map = {}
+    for row in (cap_resp.data or []):
+        uid, sid = str(row.get("university_id")), str(row.get("specialty_id"))
+        cap = int(row.get("capacity") or 0)
+        if cap > 0:
+            supply_map[(uid, sid)] = cap
 
+    # --- 2. Fetch Demand (Region Requests) ---
+    # demand_map: {(region_id, spec_id) -> int_amount_needed}
+    # demand_ids_map: {(region_id, spec_id) -> demand_request_id} (optional, for tracking)
+    demands_resp = supabase_client.table("demand_requests").select(
+        "id, region_id, specialty_id, initial_allocation, user_allocation"
+    ).execute()
+    
+    demand_map = {}
+    
+    # Apply filter if provided (for single row re-calculation)
+    raw_demands = demands_resp.data or []
+    if demand_filter:
+        filter_set = {(str(r), str(s)) for r, s in demand_filter}
+        raw_demands = [d for d in raw_demands if (str(d.get("region_id")), str(d.get("specialty_id"))) in filter_set]
+
+    for d in raw_demands:
+        rid, sid = str(d.get("region_id")), str(d.get("specialty_id"))
+        # Use user_allocation if set, otherwise initial. Max ensures no negatives.
+        amt = d.get("user_allocation")
+        if amt is None:
+            amt = d.get("initial_allocation") or 0
+        amt = max(0, int(amt))
+        
+        if amt > 0:
+            demand_map[(rid, sid)] = amt
+
+    # --- 3. Build the Graph Edges (Proximity Rules) ---
+    # We fetch ALL edges because even if we filter demands, we need to know valid uni routes.
+    prox_resp = supabase_client.table("university_region_proximity").select(
+        "university_id, region_id, priority"
+    ).execute()
+    
+    # Priority Weights: Lower number = Process First
+    priority_rank = {
+        "primary": 1,      # Local Oblast (60-95%)
+        "secondary": 2,    # Neighbor/Cluster (5-30%)
+        "tertiary": 3,     # National (1-10%)
+        "specialized": 4   # Research Centers
+    }
+    
+    edges = []
+    
+    for row in (prox_resp.data or []):
+        uid = str(row.get("university_id"))
+        rid = str(row.get("region_id"))
+        p_str = (row.get("priority") or "").strip().lower()
+        rank = priority_rank.get(p_str, 99) # 99 for unknown
+        
+        edges.append({
+            "u": uid,
+            "r": rid,
+            "rank": rank
+        })
+
+    # --- 4. The Greedy Graph Walk ---
+    
+    # Sort edges: Primary connections first. 
+    # If priorities are equal, we could add secondary sort (e.g., geographic distance if available), 
+    # but for now, we rely on the DB order.
+    edges.sort(key=lambda x: x["rank"])
+    
     assignments = []
-
-    for d in demands:
-        region_id = d["region_id"]
-        specialty_id = d["specialty_id"]
-        amount_left = d["amount"]
-        rid_str = str(region_id)
-
-        candidates = []
-        for (uid, sid), cap in remaining_capacity.items():
-            if sid != specialty_id or cap <= 0:
+    
+    # We iterate through the sorted edges (The "Graph Logic")
+    # For every connection (e.g., KazNMU -> Almaty [Primary]), we try to push max graduates.
+    for edge in edges:
+        uid = edge["u"]
+        rid = edge["r"]
+        
+        # We need to find specialties that BOTH this Uni has AND this Region needs
+        # This is an intersection of keys in supply_map and demand_map for this u/r pair
+        
+        # Optimization: Pre-calculate relevant specialties for this uni to avoid looping all specs
+        # But given Python speed, iterating the intersection is safer.
+        
+        # Find all specialties this university has capacity for
+        uni_specs = [s for (u, s) in supply_map.keys() if u == uid]
+        
+        for sid in uni_specs:
+            # Check if this region actually needs this specialty
+            needed = demand_map.get((rid, sid), 0)
+            if needed <= 0:
                 continue
-            u = universities.get(uid)
-            if not u:
+                
+            # Check if uni has capacity
+            available = supply_map.get((uid, sid), 0)
+            if available <= 0:
                 continue
-            candidates.append((uid, cap, u))
-
-        if not candidates:
-            continue
-
-        # Sort by priority tier (primary → secondary → tertiary → specialized → none), then by capacity descending
-        def sort_key(item):
-            uid, cap, u = item
-            uid_str = str(uid)
-            pri = region_uni_priority.get((rid_str, uid_str), 4)  # 4 = not in table (last)
-            return (pri, -cap)
-
-        candidates.sort(key=sort_key)
-
-        for uid, cap, u in candidates:
-            if amount_left <= 0:
-                break
-            key = (str(uid), str(specialty_id))
-            available = remaining_capacity.get(key, 0)
-            take = min(amount_left, available)
-            if take <= 0:
-                continue
-            remaining_capacity[key] = available - take
-            amount_left -= take
+                
+            # --- EXECUTE TRANSFER ---
+            # Greedy allocation: take as much as possible
+            flow = min(needed, available)
+            
+            # Record assignment
             assignments.append({
-                "region_id": region_id,
-                "specialty_id": specialty_id,
+                "region_id": rid,
+                "specialty_id": sid,
                 "university_id": uid,
-                "allocated_count": take,
+                "allocated_count": flow
             })
+            
+            # Update the graph state (reduce capacity and demand)
+            supply_map[(uid, sid)] = available - flow
+            demand_map[(rid, sid)] = needed - flow
 
-    return assignments
+    # Note: Assignments might contain multiple entries for the same (Region, Spec, Uni) 
+    # if we had duplicate edges (unlikely) or complex loops. 
+    # We consolidate them just in case.
+    
+    consolidated = {}
+    for a in assignments:
+        key = (a["region_id"], a["specialty_id"], a["university_id"])
+        consolidated[key] = consolidated.get(key, 0) + a["allocated_count"]
+        
+    final_output = []
+    for (rid, sid, uid), count in consolidated.items():
+        final_output.append({
+            "region_id": rid,
+            "specialty_id": sid,
+            "university_id": uid,
+            "allocated_count": count
+        })
+        
+    return final_output
 
 
 # --- Excel Parser Helper ---
@@ -504,7 +545,7 @@ async def process_uploaded_graduates(content, supabase_client, session_id=None, 
                 "specialty": specialty_name or r.get("specialty"),
                 "graduate_count": r["graduate_count"],
                 "source_file_name": file_name,
-                "uploaded_at": datetime.utcnow().isoformat(),
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
             }
             if specialty_id is not None:
                 payload["specialty_id"] = specialty_id
@@ -542,7 +583,7 @@ async def create_session(request: CreateSessionRequest):
             "total_budget": request.total_budget,
             "uploaded_by": request.uploaded_by,
             "status": "draft",
-            "uploaded_at": datetime.utcnow().isoformat()
+            "uploaded_at": datetime.now(timezone.utc).isoformat()
         }
         
         result = supabase.table("allocation_sessions").insert(session_data).execute()
@@ -906,7 +947,7 @@ async def adjust_allocation(demand_id: str, request: AdjustAllocationRequest):
         update_data = {
             "user_allocation": request.new_allocation,
             "notes": request.notes,
-            "updated_at": datetime.utcnow().isoformat()
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }
         
         result = supabase.table("demand_requests").update(update_data).eq("id", demand_id).execute()
@@ -940,7 +981,7 @@ async def bulk_adjust_allocations(request: BulkAdjustRequest):
                 result = supabase.table("demand_requests").update({
                     "user_allocation": adj.new_allocation,
                     "notes": adj.notes,
-                    "updated_at": datetime.utcnow().isoformat()
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 }).eq("id", adj.demand_request_id).execute()
                 
                 if result.data:
@@ -987,7 +1028,7 @@ async def finalize_session(session_id: str, request: FinalizeSessionRequest):
         # Update session status
         result = supabase.table("allocation_sessions").update({
             "status": "finalized",
-            "finalized_at": datetime.utcnow().isoformat()
+            "finalized_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", session_id).execute()
         
         if not result.data:
@@ -998,7 +1039,7 @@ async def finalize_session(session_id: str, request: FinalizeSessionRequest):
             "session_id": session_id,
             "action": "session_finalized",
             "changed_by": request.finalized_by,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
         
         return {
