@@ -182,176 +182,149 @@ def _get_db_maps(supabase_client):
 
 # --- CORE LOGIC: Strict Waterfall Allocation ---
 
+ALLOCATION_TIERS = [
+    {"role": "specialized", "rank": 4, "cap": 0.05}, # Process Specialized FIRST, but limit to 5% (Skim the cream)
+    {"role": "primary",     "rank": 1, "cap": 0.95}, # Primary takes the bulk (up to 95%)
+    {"role": "secondary",   "rank": 2, "cap": 0.30}, # Secondary helps out
+    {"role": "tertiary",    "rank": 3, "cap": 1.00}, # Tertiary/National fills the rest
+]
+
 def _compute_geo_university_allocations(supabase_client, demand_filter: Optional[Set[Tuple[str, str]]] = None, session_id: Optional[str] = None):
     """
-    Allocates grants strictly based on the SQL prioritization logic:
-    1. Primary (Local) -> Fill first.
-    2. Secondary (Regional Neighbors) -> Fill second.
-    3. Tertiary (National: KazNMU, MUA, etc.) -> Fill third.
-    4. Specialized -> Fill last.
-    Uses initial_allocation for demand quantity (algorithm output before user edits).
-    When session_id is provided, only demands for that session are used.
+    Multi-Pass Allocation Algorithm:
+    1. Specialized Pass: Give specialized centers a small share (5%) first.
+    2. Primary Pass: Give regional uni the bulk (up to 95%).
+    3. Secondary/Tertiary Pass: Fill deficits.
+    4. Fallback: Use any available university capacity for unassigned regions.
     """
     
-    # 1. Fetch Supply: Capacity per (Uni, Specialty)
+    # 1. Fetch Supply (Capacity)
     cap_resp = supabase_client.table("university_specialty_capacity").select("university_id, specialty_id, capacity").execute()
     supply_map = {} # (uid, sid) -> remaining_capacity
     for row in (cap_resp.data or []):
         k = (str(row["university_id"]), str(row["specialty_id"]))
         supply_map[k] = int(row["capacity"] or 0)
 
-    # 2. Fetch Demand: Requests per (Region, Specialty); use initial_allocation, cap by session total_budget
+    # 2. Fetch Demand
+    # Use 'initial_allocation' as the source of truth for quantity needed
     demands_resp = supabase_client.table("demand_requests").select(
         "region_id, specialty_id, initial_allocation, session_id"
     ).execute()
+    
     demands = []
-    session_id_from_demand = None
     for row in (demands_resp.data or []):
+        # Filter by Session
         if session_id and str(row.get("session_id") or "") != str(session_id):
             continue
+            
         rid, sid = str(row["region_id"]), str(row["specialty_id"])
+        
+        # Filter by specific Region/Specialty if requested
         if demand_filter and (rid, sid) not in demand_filter:
             continue
+            
         qty = row.get("initial_allocation") or 0
         if qty > 0:
-            if row.get("session_id"):
-                session_id_from_demand = str(row["session_id"])
-            demands.append({"region_id": rid, "specialty_id": sid, "needed": int(qty)})
-    total_budget = None
-    session_for_budget = session_id or session_id_from_demand
-    if session_for_budget:
-        try:
-            sess = supabase_client.table("allocation_sessions").select("total_budget").eq(
-                "id", session_for_budget
-            ).execute()
-            if sess.data and len(sess.data) > 0 and (sess.data[0].get("total_budget") or 0) > 0:
-                total_budget = int(sess.data[0]["total_budget"])
-        except Exception:
-            pass
-    if total_budget is not None and total_budget > 0:
-        total_needed = sum(d["needed"] for d in demands)
-        if total_needed > total_budget:
-            cap = total_budget
-            factor = cap / total_needed
-            for d in demands:
-                d["needed"] = int(d["needed"] * factor)
-            remainder = cap - sum(d["needed"] for d in demands)
-            if remainder > 0:
-                with_frac = [(i, d["needed"] * factor - int(d["needed"] * factor)) for i, d in enumerate(demands)]
-                with_frac.sort(key=lambda x: -x[1])
-                for j in range(min(remainder, len(with_frac))):
-                    demands[with_frac[j][0]]["needed"] += 1
+            demands.append({
+                "region_id": rid, 
+                "specialty_id": sid, 
+                "total_needed": int(qty), # Original demand size
+                "remaining_needed": int(qty) # What's left to allocate
+            })
 
-    # 3. Fetch Matrix: Proximity Priorities (The Source of Truth)
-    # This table assumes the User's SQL has been run.
+    # 3. Fetch Priority Matrix
     prox_resp = supabase_client.table("university_region_proximity").select("university_id, region_id, priority").execute()
-    proximity_map = {} # (uid, rid) -> priority_rank (int)
     
-    # Pre-process priorities
-    uni_serving_region = {} # region_id -> list of (uid, priority_rank)
+    # Map: region_id -> { "primary": [uid, ...], "specialized": [uid, ...], ... }
+    region_providers = {}
     
     for row in (prox_resp.data or []):
         uid = str(row["university_id"])
         rid = str(row["region_id"])
-        p_str = (row["priority"] or "").lower().strip()
-        rank = PRIORITY_ORDER.get(p_str, 99)
-        proximity_map[(uid, rid)] = rank
+        role = (row["priority"] or "").lower().strip() # primary, secondary, specialized
         
-        if rid not in uni_serving_region:
-            uni_serving_region[rid] = []
-        uni_serving_region[rid].append((uid, rank))
-
-    # Sort universities for each region by strict rank
-    for rid in uni_serving_region:
-        uni_serving_region[rid].sort(key=lambda x: x[1]) # Sort by rank (1=Primary asc)
-
-    # 3b. КАЗНМУ: add to every region so every (region, specialty) has at least one candidate
-    kaznmu_id = _find_kaznmu_id(supabase_client)
-    if kaznmu_id:
-        try:
-            regions_resp = supabase_client.table("regions").select("id, name").execute()
-            region_id_to_name = {}
-            for r in (regions_resp.data or []):
-                region_id_to_name[str(r.get("id"))] = _normalize_name_for_lookup(r.get("name") or "")
-        except Exception:
-            region_id_to_name = {}
-        all_rids = set(d["region_id"] for d in demands) | set(uni_serving_region.keys())
-        for rid in all_rids:
-            if not rid:
-                continue
-            region_norm = region_id_to_name.get(rid, "")
-            kaznmu_rank = _kaznmu_rank_for_region(region_norm)
-            existing_uids = {u for u, _ in uni_serving_region.get(rid, [])}
-            if kaznmu_id not in existing_uids:
-                uni_serving_region.setdefault(rid, []).append((kaznmu_id, kaznmu_rank))
-        for rid in uni_serving_region:
-            uni_serving_region[rid].sort(key=lambda x: x[1])
-
-    # Process demands by (specialty_id, needed ASC, region_id) so small demands get filled first and more regions get a university
-    demands_sorted = sorted(demands, key=lambda d: (d["specialty_id"], d["needed"], d["region_id"]))
+        if rid not in region_providers:
+            region_providers[rid] = {}
+        if role not in region_providers[rid]:
+            region_providers[rid][role] = []
+        region_providers[rid][role].append(uid)
 
     allocations = [] # Result list
 
-    # 4. Allocation Algorithm
-    for demand in demands_sorted:
+    # 4. Allocation Loop
+    for demand in demands:
         rid = demand["region_id"]
         sid = demand["specialty_id"]
-        needed = demand["needed"]
         
-        if needed <= 0: continue
+        if demand["remaining_needed"] <= 0: continue
 
-        # Get candidates for this region
-        candidates = uni_serving_region.get(rid, [])
-        
-        # Iteration 1: Strict Priority Waterfall
-        # We walk through candidates: Primary first, then Secondary, etc.
-        for uid, rank in candidates:
-            if needed <= 0: break
+        # --- TIERED PASSES ---
+        for tier in ALLOCATION_TIERS:
+            role = tier["role"]
+            cap_pct = tier["cap"]
             
-            # Check if Uni has capacity for this Specialty
-            cap_key = (uid, sid)
-            available = supply_map.get(cap_key, 0)
+            # How many can we take in this tier?
+            # E.g. Specialized max = 5% of TOTAL needed.
+            tier_limit = int(demand["total_needed"] * cap_pct)
+            if tier_limit == 0 and cap_pct > 0 and demand["total_needed"] > 0:
+                 tier_limit = 1 # Ensure at least 1 if percentage is small but non-zero
             
-            if available > 0:
-                # Allocating
-                take = min(needed, available)
+            # Candidates for this region & role
+            candidates = region_providers.get(rid, {}).get(role, [])
+            
+            for uid in candidates:
+                if demand["remaining_needed"] <= 0: break
                 
-                # Update State
+                # Check Supply
+                cap_key = (uid, sid)
+                available = supply_map.get(cap_key, 0)
+                
+                if available > 0:
+                    # Calculate take amount
+                    # Cannot exceed: 1. Remaining Need, 2. Supply, 3. Tier Limit
+                    take = min(demand["remaining_needed"], available, tier_limit)
+                    
+                    if take > 0:
+                        allocations.append({
+                            "region_id": rid, 
+                            "specialty_id": sid, 
+                            "university_id": uid, 
+                            "allocated_count": take,
+                            "priority_applied": tier["rank"]
+                        })
+                        
+                        # Update State
+                        supply_map[cap_key] -= take
+                        demand["remaining_needed"] -= take
+                        tier_limit -= take # Decrement tier limit so we don't exceed cap across multiple unis of same tier
+
+        # --- FALLBACK PASS (The "Save Unallocated Regions" Phase) ---
+        # If we still have need, ignore geography and find ANY uni with capacity.
+        if demand["remaining_needed"] > 0:
+            # Find all unis with capacity for this specialty
+            possible_unis = [u for u, c in supply_map.items() if u[1] == sid and c > 0]
+            # Sort by capacity desc (give to the biggest available uni)
+            possible_unis.sort(key=lambda x: supply_map[x], reverse=True)
+            
+            for (uid, _) in possible_unis:
+                if demand["remaining_needed"] <= 0: break
+                
+                cap_key = (uid, sid)
+                available = supply_map[cap_key]
+                take = min(demand["remaining_needed"], available)
+                
                 allocations.append({
                     "region_id": rid, 
                     "specialty_id": sid, 
                     "university_id": uid, 
                     "allocated_count": take,
-                    "priority_applied": rank
+                    "priority_applied": 99 # Fallback
                 })
                 
                 supply_map[cap_key] -= take
-                needed -= take
+                demand["remaining_needed"] -= take
 
-        # Iteration 2: Fallback (Desperation)
-        # If needed > 0, find ANY university with capacity for this specialty, ignoring region
-        if needed > 0:
-            # Find all unis with capacity for this specialty
-            fallback_unis = [u for u, c in supply_map.items() if u[1] == sid and c > 0]
-            # Sort by capacity desc to fill quickly
-            fallback_unis.sort(key=lambda x: supply_map[x], reverse=True)
-            
-            for (uid, _) in fallback_unis:
-                if needed <= 0: break
-                available = supply_map[(uid, sid)]
-                take = min(needed, available)
-                
-                allocations.append({
-                    "region_id": rid,
-                    "specialty_id": sid,
-                    "university_id": uid,
-                    "allocated_count": take,
-                    "priority_applied": 99 # Fallback
-                })
-                supply_map[(uid, sid)] -= take
-                needed -= take
-
-    # Consolidate results (merge multiple entries for same reg/spec/uni)
+    # 5. Consolidate results
     consolidated = {}
     for a in allocations:
         key = (a["region_id"], a["specialty_id"], a["university_id"])
