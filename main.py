@@ -36,6 +36,36 @@ PRIORITY_ORDER = {
     "none": 99         # Fallback
 }
 
+# КАЗНМУ (National University): add to ALL regions so every region has at least one candidate
+KAZNMU_PRIMARY_KEYWORDS = ("алматы", "жетысуская", "алматинская")
+KAZNMU_SECONDARY_KEYWORDS = ("жамбылская", "туркестанская", "кызылординская", "шымкент")
+
+
+def _find_kaznmu_id(supabase_client):
+    """Return university id for КАЗНМУ (name contains КазНМУ or Асфендиярова), or None."""
+    try:
+        data = supabase_client.table("universities").select("id, name").execute().data or []
+        for row in data:
+            name = (row.get("name") or "").strip().lower()
+            if "казнму" in name or "асфендиярова" in name:
+                return str(row.get("id"))
+    except Exception:
+        pass
+    return None
+
+
+def _kaznmu_rank_for_region(region_name_normalized: str) -> int:
+    """Return priority rank for КАЗНМУ in this region: 1=primary, 2=secondary, 3=tertiary."""
+    if not region_name_normalized:
+        return 3
+    r = region_name_normalized.strip().lower()
+    if any(kw in r for kw in KAZNMU_PRIMARY_KEYWORDS):
+        return 1
+    if any(kw in r for kw in KAZNMU_SECONDARY_KEYWORDS):
+        return 2
+    return 3
+
+
 # --- Pydantic Models ---
 class CreateSessionRequest(BaseModel):
     session_name: str
@@ -196,10 +226,35 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
     for rid in uni_serving_region:
         uni_serving_region[rid].sort(key=lambda x: x[1]) # Sort by rank (1=Primary asc)
 
+    # 3b. КАЗНМУ: add to every region so every (region, specialty) has at least one candidate
+    kaznmu_id = _find_kaznmu_id(supabase_client)
+    if kaznmu_id:
+        try:
+            regions_resp = supabase_client.table("regions").select("id, name").execute()
+            region_id_to_name = {}
+            for r in (regions_resp.data or []):
+                region_id_to_name[str(r.get("id"))] = _normalize_name_for_lookup(r.get("name") or "")
+        except Exception:
+            region_id_to_name = {}
+        all_rids = set(d["region_id"] for d in demands) | set(uni_serving_region.keys())
+        for rid in all_rids:
+            if not rid:
+                continue
+            region_norm = region_id_to_name.get(rid, "")
+            kaznmu_rank = _kaznmu_rank_for_region(region_norm)
+            existing_uids = {u for u, _ in uni_serving_region.get(rid, [])}
+            if kaznmu_id not in existing_uids:
+                uni_serving_region.setdefault(rid, []).append((kaznmu_id, kaznmu_rank))
+        for rid in uni_serving_region:
+            uni_serving_region[rid].sort(key=lambda x: x[1])
+
+    # Process demands by (specialty_id, needed ASC, region_id) so small demands get filled first and more regions get a university
+    demands_sorted = sorted(demands, key=lambda d: (d["specialty_id"], d["needed"], d["region_id"]))
+
     allocations = [] # Result list
 
     # 4. Allocation Algorithm
-    for demand in demands:
+    for demand in demands_sorted:
         rid = demand["region_id"]
         sid = demand["specialty_id"]
         needed = demand["needed"]
