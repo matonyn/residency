@@ -6,10 +6,10 @@ Supports both Excel (.xlsx) and PDF uploads
 import os
 import uuid
 from datetime import datetime
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Set, Tuple
 import sys
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
@@ -66,6 +66,24 @@ class RunAllocationRequest(BaseModel):
     total_grants: Optional[int] = None  # default: session.total_budget
 
 
+class UniversityAssignmentItem(BaseModel):
+    university_id: str
+    allocated_count: int
+
+
+class UpsertUniversityAllocationsRequest(BaseModel):
+    """Replace all university assignments for one (region, specialty)."""
+    region_id: str
+    specialty_id: str
+    assignments: List[UniversityAssignmentItem]
+
+
+class GeoFilterRequest(BaseModel):
+    """Optional filter to recompute geo allocation for a single (region, specialty) only."""
+    region_id: Optional[str] = None
+    specialty_id: Optional[str] = None
+
+
 # --- Allocation Logic ---
 
 ALLOCATION_PRIORITIES = ("historic_deficit", "requested_amount", "last_year_data")
@@ -95,78 +113,43 @@ def allocation_by_priority(priority: str, rows: List[dict]) -> List[int]:
     return result
 
 
-# --- Geographic University Allocation ---
+# --- Geographic University Allocation (hardcoded proximity by region grouping) ---
 
-import math
-
-# Approximate centroids for Kazakhstan regions/cities (lat, lng) for distance ordering.
-# Names normalized for lookup: lowercase, no "г." / "область".
-REGION_CENTROIDS = {
-    "алматы": (43.238949, 76.945465),
-    "астана": (51.160522, 71.470355),
-    "шымкент": (42.341686, 69.590101),
-    "акмолинская": (51.916667, 69.416667),
-    "актюбинская": (50.283333, 57.166667),
-    "алматинская": (45.016667, 78.383333),
-    "атырауская": (47.116667, 51.916667),
-    "восточно-казахстанская": (49.95, 82.616667),
-    "жамбылская": (43.333333, 71.25),
-    "западно-казахстанская": (50.25, 51.366667),
-    "карагандинская": (47.8, 71.95),
-    "костанайская": (53.216667, 63.633333),
-    "кызылординская": (44.85, 65.516667),
-    "мангистауская": (43.65, 51.15),
-    "павлодарская": (52.283333, 76.95),
-    "северо-казахстанская": (54.866667, 69.15),
-    "туркестанская": (43.3, 68.25),
-    "улытауская": (47.7, 66.9),
-    "абай": (49.633333, 80.0),
-    "жуалынский": (42.9, 70.9),
-    "улытау": (47.7, 66.9),
-    "жетысу": (45.5, 79.5),
-}
-
-
-def _normalize_region_for_centroid(name: str) -> str:
-    """Normalize region name for centroid lookup."""
-    if not name:
-        return ""
-    s = (name or "").strip().lower()
-    for prefix in ("г.", "город ", "обл.", "область "):
-        if s.startswith(prefix):
-            s = s[len(prefix) :].strip()
-    return s.replace("  ", " ").strip()
-
-
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distance in km between two (lat, lon) points."""
-    R = 6371.0  # Earth radius km
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
-
-
-def _compute_geo_university_allocations(supabase_client) -> List[dict]:
+def _compute_geo_university_allocations(
+    supabase_client,
+    demand_filter: Optional[Set[Tuple[str, str]]] = None,
+) -> List[dict]:
     """
-    For each (region, specialty) demand, greedily assign grants to the closest universities
-    (same region first, then by haversine distance). Respects university_specialty_capacity.
+    For each (region, specialty) demand, greedily assign grants to universities
+    using hardcoded proximity: university_region_proximity table groups which regions
+    each university "serves". Universities proximate to the demand region come first.
+    Respects university_specialty_capacity.
+    If demand_filter is set, only process demands for (region_id, specialty_id) in that set.
     Returns list of { region_id, specialty_id, university_id, allocated_count }.
     """
-    # Fetch demands: region_id, specialty_id, amount (initial_allocation or user_allocation)
     demands_resp = supabase_client.table("demand_requests").select(
         "id, region_id, specialty_id, initial_allocation, user_allocation"
     ).execute()
     demands_raw = demands_resp.data or []
-    # Resolve region names for centroid lookup
+    if demand_filter is not None:
+        demand_filter_str = {(str(r), str(s)) for r, s in demand_filter}
+        demands_raw = [d for d in demands_raw if (str(d.get("region_id")), str(d.get("specialty_id"))) in demand_filter_str]
     region_ids = list({d["region_id"] for d in demands_raw if d.get("region_id")})
-    region_names_by_id = {}
-    if region_ids:
-        regions_resp = supabase_client.table("regions").select("id, name").in_("id", region_ids).execute()
-        for r in (regions_resp.data or []):
-            region_names_by_id[r["id"]] = (r.get("name") or "").strip()
+
+    # Priority: (region_id, university_id) -> priority (primary=0, secondary=1, tertiary=2, specialized=3)
+    priority_order = {"primary": 0, "secondary": 1, "tertiary": 2, "specialized": 3}
+    region_uni_priority = {}  # (rid_str, uid_str) -> 0..3
+    try:
+        prox_resp = supabase_client.table("university_region_proximity").select(
+            "region_id, university_id, priority"
+        ).in_("region_id", region_ids).execute()
+        for row in (prox_resp.data or []):
+            rid, uid = str(row.get("region_id")), str(row.get("university_id"))
+            pri = (row.get("priority") or "").strip().lower()
+            if rid and uid and pri in priority_order:
+                region_uni_priority[(rid, uid)] = priority_order[pri]
+    except Exception:
+        pass
 
     demands = []
     for d in demands_raw:
@@ -179,22 +162,14 @@ def _compute_geo_university_allocations(supabase_client) -> List[dict]:
         amount = max(0, int(amount))
         if amount <= 0:
             continue
-        demands.append({
-            "region_id": rid,
-            "specialty_id": sid,
-            "region_name": region_names_by_id.get(rid) or "",
-            "amount": amount,
-        })
+        demands.append({"region_id": str(rid), "specialty_id": str(sid), "amount": amount})
 
-    # Universities: id, region_id, lat, lng
-    unis_resp = supabase_client.table("universities").select("id, region_id, lat, lng").execute()
+    unis_resp = supabase_client.table("universities").select("id, region_id").execute()
     universities = {u["id"]: u for u in (unis_resp.data or [])}
 
-    # Capacity per (university_id, specialty_id)
     cap_resp = supabase_client.table("university_specialty_capacity").select(
         "university_id, specialty_id, capacity"
     ).execute()
-    # remaining_capacity[(uni_id, spec_id)] = int
     remaining_capacity = {}
     for row in cap_resp.data or []:
         uid, sid, cap = row.get("university_id"), row.get("specialty_id"), int(row.get("capacity") or 0)
@@ -206,10 +181,9 @@ def _compute_geo_university_allocations(supabase_client) -> List[dict]:
     for d in demands:
         region_id = d["region_id"]
         specialty_id = d["specialty_id"]
-        region_name = d["region_name"]
         amount_left = d["amount"]
+        rid_str = str(region_id)
 
-        # Universities that have capacity for this specialty
         candidates = []
         for (uid, sid), cap in remaining_capacity.items():
             if sid != specialty_id or cap <= 0:
@@ -222,18 +196,12 @@ def _compute_geo_university_allocations(supabase_client) -> List[dict]:
         if not candidates:
             continue
 
-        # Region centroid for distance
-        centroid = REGION_CENTROIDS.get(_normalize_region_for_centroid(region_name))
-
+        # Sort by priority tier (primary → secondary → tertiary → specialized → none), then by capacity descending
         def sort_key(item):
             uid, cap, u = item
-            same_region = 0 if str(u.get("region_id") or "") == str(region_id) else 1
-            u_lat, u_lng = u.get("lat"), u.get("lng")
-            if centroid and u_lat is not None and u_lng is not None:
-                dist_km = _haversine_km(centroid[0], centroid[1], float(u_lat), float(u_lng))
-            else:
-                dist_km = 9999.0 if same_region else 10000.0
-            return (same_region, dist_km, -cap)  # same region first, then by distance, then prefer larger capacity
+            uid_str = str(uid)
+            pri = region_uni_priority.get((rid_str, uid_str), 4)  # 4 = not in table (last)
+            return (pri, -cap)
 
         candidates.sort(key=sort_key)
 
@@ -1307,16 +1275,83 @@ async def list_graduates(year: Optional[int] = None, session_id: Optional[str] =
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/university-allocations/geo")
-async def compute_geo_university_allocations(save: bool = False):
+@app.get("/university-allocations")
+async def list_university_allocations(
+    region_id: Optional[str] = None,
+    specialty_id: Optional[str] = None,
+):
     """
-    Compute university allocations by geography: for each (region, specialty) demand,
-    greedily assign grants to the closest universities (same region first, then by
-    haversine distance from region centroid). Respects university_specialty_capacity.
-    Returns the list of assignments. If save=true, upserts into university_allocation_assignments.
+    List university allocation assignments. Optional filters: region_id, specialty_id.
+    Returns list of { region_id, specialty_id, university_id, allocated_count }.
     """
     try:
-        assignments = _compute_geo_university_allocations(supabase)
+        query = supabase.table("university_allocation_assignments").select(
+            "region_id, specialty_id, university_id, allocated_count"
+        )
+        if region_id:
+            query = query.eq("region_id", region_id)
+        if specialty_id:
+            query = query.eq("specialty_id", specialty_id)
+        resp = query.execute()
+        data = resp.data or []
+        return {"assignments": data, "count": len(data)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/university-allocations")
+async def upsert_university_allocations(request: UpsertUniversityAllocationsRequest):
+    """
+    Replace all university assignments for one (region_id, specialty_id).
+    Validates allocated_count >= 0. Does not check capacity or demand total.
+    """
+    try:
+        region_id = request.region_id
+        specialty_id = request.specialty_id
+        # Delete existing for this (region, specialty)
+        supabase.table("university_allocation_assignments").delete().eq(
+            "region_id", region_id
+        ).eq("specialty_id", specialty_id).execute()
+        # Insert new rows (only those with count > 0)
+        inserted = 0
+        for item in request.assignments:
+            count = max(0, int(item.allocated_count))
+            if count <= 0:
+                continue
+            supabase.table("university_allocation_assignments").insert({
+                "region_id": region_id,
+                "specialty_id": specialty_id,
+                "university_id": item.university_id,
+                "allocated_count": count,
+            }).execute()
+            inserted += 1
+        return {
+            "status": "success",
+            "region_id": region_id,
+            "specialty_id": specialty_id,
+            "assignments_count": inserted,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/university-allocations/geo")
+async def compute_geo_university_allocations(
+    save: bool = False,
+    body: Optional[GeoFilterRequest] = Body(None),
+):
+    """
+    Compute university allocations by geography: for each (region, specialty) demand,
+    greedily assign by priority (primary → secondary → tertiary → specialized).
+    Respects university_specialty_capacity.
+    Returns the list of assignments. If save=true, upserts into university_allocation_assignments.
+    Optional body: { region_id?, specialty_id? } to recompute only for that (region, specialty).
+    """
+    try:
+        demand_filter = None
+        if body and body.region_id and body.specialty_id:
+            demand_filter = {(body.region_id, body.specialty_id)}
+        assignments = _compute_geo_university_allocations(supabase, demand_filter=demand_filter)
         if save and assignments:
             try:
                 # Delete existing geo assignments for (region, specialty) pairs we're recomputing
