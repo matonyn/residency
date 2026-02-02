@@ -183,23 +183,26 @@ def _get_db_maps(supabase_client):
 # --- CORE LOGIC: Strict Waterfall Allocation ---
 
 # --- Allocation Constants ---
+# --- Allocation Constants ---
 ALLOCATION_TIERS = [
-    {"role": "specialized", "rank": 4, "cap": 0.05}, # 1. specialized centers (5% share)
-    {"role": "primary",     "rank": 1, "cap": 0.95}, # 2. primary regional (95% share)
-    {"role": "secondary",   "rank": 2, "cap": 0.30}, # 3. secondary neighbors
-    {"role": "tertiary",    "rank": 3, "cap": 1.00}, # 4. national universities
+    {"role": "specialized", "rank": 4, "cap": 0.05}, # 1. Specialized (5%)
+    {"role": "primary",     "rank": 1, "cap": 0.95}, # 2. Primary (95%)
+    {"role": "secondary",   "rank": 2, "cap": 0.30}, # 3. Secondary (30%)
+    {"role": "tertiary",    "rank": 3, "cap": 1.00}, # 4. National (Fill rest)
 ]
 
 def _compute_geo_university_allocations(supabase_client, demand_filter: Optional[Set[Tuple[str, str]]] = None, session_id: Optional[str] = None):
     """
-    Robust Allocation: Automatically detects Specialized Centers based on capacity 
-    and makes them available to all regions.
+    Allocates grants using:
+    1. User's manual 'user_allocation' if set (Highest Priority).
+    2. Tiered Geo-Priority (Specialized -> Primary -> Secondary).
+    3. Universal Fallback (Any university with capacity).
     """
     
     # 1. Fetch Supply (Capacity)
     cap_resp = supabase_client.table("university_specialty_capacity").select("university_id, specialty_id, capacity").execute()
     supply_map = {} 
-    unis_with_capacity = set() # Track who actually has seats
+    unis_with_capacity = set()
     
     for row in (cap_resp.data or []):
         uid = str(row["university_id"])
@@ -208,9 +211,9 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
             supply_map[(uid, str(row["specialty_id"]))] = cap
             unis_with_capacity.add(uid)
 
-    # 2. Fetch Demand
+    # 2. Fetch Demand (Use user_allocation if available)
     demands_resp = supabase_client.table("demand_requests").select(
-        "region_id, specialty_id, initial_allocation, session_id"
+        "region_id, specialty_id, initial_allocation, user_allocation, session_id"
     ).execute()
     
     demands = []
@@ -223,19 +226,24 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
         if demand_filter and (rid, sid) not in demand_filter:
             continue
         
-        qty = row.get("initial_allocation") or 0
-        if qty > 0:
+        # FIX: Respect User Edit!
+        qty = row.get("user_allocation")
+        if qty is None:
+            qty = row.get("initial_allocation")
+        
+        needed = int(qty or 0)
+        if needed > 0:
             demands.append({
                 "region_id": rid, "specialty_id": sid, 
-                "total_needed": int(qty), "remaining_needed": int(qty)
+                "total_needed": needed, "remaining_needed": needed
             })
             all_region_ids.add(rid)
 
-    # 3. Fetch Priority Matrix (The "Manual" Rules)
+    # 3. Fetch Priority Matrix
     prox_resp = supabase_client.table("university_region_proximity").select("university_id, region_id, priority").execute()
     
-    region_providers = {} # region_id -> { "primary": [uid], ... }
-    explicitly_assigned_unis = set() # Unis that are explicitly linked to a region
+    region_providers = {} 
+    explicitly_assigned_unis = set()
     
     for row in (prox_resp.data or []):
         uid = str(row["university_id"])
@@ -246,17 +254,11 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
         if role not in region_providers[rid]: region_providers[rid][role] = []
         
         region_providers[rid][role].append(uid)
-        
-        # Track unis that are "Regional" (Primary/Secondary)
         if role in ('primary', 'secondary'):
             explicitly_assigned_unis.add(uid)
 
-    # --- 4. AUTO-DISCOVERY OF SPECIALIZED CENTERS ---
-    # Logic: If a uni has capacity but is NOT a regional primary/secondary uni, 
-    # treat it as a Specialized Center available to ALL regions.
+    # 4. Auto-Add Specialized Centers
     specialized_centers = unis_with_capacity - explicitly_assigned_unis
-    
-    # Inject them into every region
     for rid in all_region_ids:
         if rid not in region_providers: region_providers[rid] = {}
         if "specialized" not in region_providers[rid]: region_providers[rid]["specialized"] = []
@@ -267,17 +269,15 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
                 region_providers[rid]["specialized"].append(uid)
 
     # 5. Allocation Loop
-    allocations = [] 
-    
-    # Sort demands to ensure consistent processing
-    demands.sort(key=lambda x: (x["specialty_id"], x["total_needed"]))
+    allocations = []
+    demands.sort(key=lambda x: (x["specialty_id"], x["total_needed"])) # Sort for consistency
 
     for demand in demands:
         rid = demand["region_id"]
         sid = demand["specialty_id"]
         if demand["remaining_needed"] <= 0: continue
 
-        # A. Tiered Passes (Specialized -> Primary -> Secondary -> Tertiary)
+        # A. Tiered Passes
         for tier in ALLOCATION_TIERS:
             if demand["remaining_needed"] <= 0: break
             
@@ -287,7 +287,6 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
             
             if not candidates: continue
             
-            # Calculate Tier Cap (e.g. max 5% for specialized)
             tier_limit = int(demand["total_needed"] * cap_pct)
             if tier_limit == 0 and cap_pct > 0: tier_limit = 1
             
@@ -302,18 +301,16 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
                     if take > 0:
                         allocations.append({
                             "region_id": rid, "specialty_id": sid, "university_id": uid, 
-                            "allocated_count": take, "priority_applied": tier["rank"]
+                            "allocated_count": take
                         })
                         supply_map[cap_key] -= take
                         demand["remaining_needed"] -= take
                         tier_limit -= take
 
-        # B. Fallback (Rescue Phase)
-        # If demand remains, give it to ANYONE with capacity, ignoring region rules.
+        # B. Universal Fallback (Prevent "No Unis" error)
+        # If demand remains, check EVERY university with capacity
         if demand["remaining_needed"] > 0:
-            # Find any uni with capacity for this specialty
             fallback_unis = [u for u, c in supply_map.items() if u[1] == sid and c > 0]
-            # Prioritize largest capacity to fill demand quickly
             fallback_unis.sort(key=lambda x: supply_map[x], reverse=True)
             
             for (uid, _) in fallback_unis:
@@ -324,21 +321,19 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
                 
                 allocations.append({
                     "region_id": rid, "specialty_id": sid, "university_id": uid, 
-                    "allocated_count": take, "priority_applied": 99
+                    "allocated_count": take
                 })
                 supply_map[(uid, sid)] -= take
                 demand["remaining_needed"] -= take
 
-    # 6. Consolidate Output
+    # 6. Consolidate
     consolidated = {}
     for a in allocations:
         key = (a["region_id"], a["specialty_id"], a["university_id"])
         consolidated[key] = consolidated.get(key, 0) + a["allocated_count"]
         
-    return [
-        {"region_id": k[0], "specialty_id": k[1], "university_id": k[2], "allocated_count": v}
-        for k, v in consolidated.items()
-    ]
+    return [{"region_id": k[0], "specialty_id": k[1], "university_id": k[2], "allocated_count": v} for k, v in consolidated.items()]
+    
 # --- Excel Parsers ---
 
 def parse_excel_full_allocation(file_content, session_id, supabase_client):
