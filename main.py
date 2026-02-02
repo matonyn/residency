@@ -166,103 +166,93 @@ def _compute_geo_university_allocations(
         if amt > 0:
             demand_map[(rid, sid)] = amt
 
-    # --- 3. Build the Graph Edges (Proximity Rules) ---
-    # We fetch ALL edges because even if we filter demands, we need to know valid uni routes.
+    # --- 3. Build region -> [(university_id, priority_rank)] per region ---
+    # So for each region we know which universities serve it and in what order (primary first).
     prox_resp = supabase_client.table("university_region_proximity").select(
         "university_id, region_id, priority"
     ).execute()
     
-    # Priority Weights: Lower number = Process First
     priority_rank = {
-        "primary": 1,      # Local Oblast (60-95%)
-        "secondary": 2,    # Neighbor/Cluster (5-30%)
-        "tertiary": 3,     # National (1-10%)
-        "specialized": 4   # Research Centers
+        "primary": 1,
+        "secondary": 2,
+        "tertiary": 3,
+        "specialized": 4,
     }
-    
-    edges = []
-    
+    # region_id -> list of (university_id, rank) sorted by rank
+    region_universities: dict = {}
     for row in (prox_resp.data or []):
         uid = str(row.get("university_id"))
         rid = str(row.get("region_id"))
         p_str = (row.get("priority") or "").strip().lower()
-        rank = priority_rank.get(p_str, 99) # 99 for unknown
-        
-        edges.append({
-            "u": uid,
-            "r": rid,
-            "rank": rank
-        })
+        rank = priority_rank.get(p_str, 99)
+        if rid not in region_universities:
+            region_universities[rid] = []
+        region_universities[rid].append((uid, rank))
+    for rid in region_universities:
+        region_universities[rid].sort(key=lambda x: (x[1], x[0]))
 
-    # --- 4. The Greedy Graph Walk ---
-    
-    # Sort edges: Primary connections first. 
-    # If priorities are equal, we could add secondary sort (e.g., geographic distance if available), 
-    # but for now, we rely on the DB order.
-    edges.sort(key=lambda x: x["rank"])
-    
+    # --- 4. Demand-first allocation ---
+    # For each (region, specialty) demand, try universities in priority order FOR THAT REGION.
+    # This ensures every region gets primary providers first, then backup; no region is starved
+    # because we processed another region's primary edges first.
     assignments = []
-    
-    # We iterate through the sorted edges (The "Graph Logic")
-    # For every connection (e.g., KazNMU -> Almaty [Primary]), we try to push max graduates.
-    for edge in edges:
-        uid = edge["u"]
-        rid = edge["r"]
-        
-        # We need to find specialties that BOTH this Uni has AND this Region needs
-        # This is an intersection of keys in supply_map and demand_map for this u/r pair
-        
-        # Optimization: Pre-calculate relevant specialties for this uni to avoid looping all specs
-        # But given Python speed, iterating the intersection is safer.
-        
-        # Find all specialties this university has capacity for
-        uni_specs = [s for (u, s) in supply_map.keys() if u == uid]
-        
-        for sid in uni_specs:
-            # Check if this region actually needs this specialty
-            needed = demand_map.get((rid, sid), 0)
+    demand_keys = list(demand_map.keys())
+    for (rid, sid) in demand_keys:
+        needed = demand_map.get((rid, sid), 0)
+        if needed <= 0:
+            continue
+        unis_for_region = region_universities.get(rid, [])
+        for uid, _rank in unis_for_region:
             if needed <= 0:
-                continue
-                
-            # Check if uni has capacity
+                break
             available = supply_map.get((uid, sid), 0)
             if available <= 0:
                 continue
-                
-            # --- EXECUTE TRANSFER ---
-            # Greedy allocation: take as much as possible
             flow = min(needed, available)
-            
-            # Record assignment
             assignments.append({
                 "region_id": rid,
                 "specialty_id": sid,
                 "university_id": uid,
-                "allocated_count": flow
+                "allocated_count": flow,
             })
-            
-            # Update the graph state (reduce capacity and demand)
             supply_map[(uid, sid)] = available - flow
-            demand_map[(rid, sid)] = needed - flow
+            needed -= flow
+        demand_map[(rid, sid)] = needed
 
-    # Note: Assignments might contain multiple entries for the same (Region, Spec, Uni) 
-    # if we had duplicate edges (unlikely) or complex loops. 
-    # We consolidate them just in case.
-    
+    # Fallback: for any (region, specialty) still with demand > 0 (e.g. no proximity rows),
+    # try any university that has capacity for that specialty.
+    remaining_demand = [(rid, sid) for (rid, sid) in demand_map if demand_map[(rid, sid)] > 0]
+    if remaining_demand:
+        all_unis = sorted(set(u for (u, _) in supply_map.keys()))
+        for (rid, sid) in remaining_demand:
+            needed = demand_map.get((rid, sid), 0)
+            if needed <= 0:
+                continue
+            for uid in all_unis:
+                if needed <= 0:
+                    break
+                available = supply_map.get((uid, sid), 0)
+                if available <= 0:
+                    continue
+                flow = min(needed, available)
+                assignments.append({
+                    "region_id": rid,
+                    "specialty_id": sid,
+                    "university_id": uid,
+                    "allocated_count": flow,
+                })
+                supply_map[(uid, sid)] = available - flow
+                needed -= flow
+            demand_map[(rid, sid)] = needed
+
     consolidated = {}
     for a in assignments:
         key = (a["region_id"], a["specialty_id"], a["university_id"])
         consolidated[key] = consolidated.get(key, 0) + a["allocated_count"]
-        
-    final_output = []
-    for (rid, sid, uid), count in consolidated.items():
-        final_output.append({
-            "region_id": rid,
-            "specialty_id": sid,
-            "university_id": uid,
-            "allocated_count": count
-        })
-        
+    final_output = [
+        {"region_id": rid, "specialty_id": sid, "university_id": uid, "allocated_count": count}
+        for (rid, sid, uid), count in consolidated.items()
+    ]
     return final_output
 
 
