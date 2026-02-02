@@ -104,6 +104,16 @@ class FinalizeSessionRequest(BaseModel):
 
 # --- Helper Functions ---
 
+def _effective_allocation(d: dict) -> int:
+    """Effective allocation: final_allocation column, with fallback to user_allocation or initial_allocation."""
+    val = d.get("final_allocation")
+    if val is not None:
+        return int(val)
+    u = d.get("user_allocation")
+    if u is not None:
+        return int(u)
+    return int(d.get("initial_allocation") or 0)
+
 def _normalize_name_for_lookup(name: str) -> str:
     """Normalize names for reliable DB lookup."""
     if not name: return ""
@@ -179,7 +189,7 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
     2. Secondary (Regional Neighbors) -> Fill second.
     3. Tertiary (National: KazNMU, MUA, etc.) -> Fill third.
     4. Specialized -> Fill last.
-    Uses approved allocations (user_allocation) when set, else initial_allocation.
+    Uses final_allocation as the effective allocation; falls back to initial_allocation if not set.
     When session_id is provided, only demands for that session are used.
     """
     
@@ -190,9 +200,9 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
         k = (str(row["university_id"]), str(row["specialty_id"]))
         supply_map[k] = int(row["capacity"] or 0)
 
-    # 2. Fetch Demand: Requests per (Region, Specialty); prefer user_allocation (approved), cap by session total_budget
+    # 2. Fetch Demand: Requests per (Region, Specialty); use final_allocation, cap by session total_budget
     demands_resp = supabase_client.table("demand_requests").select(
-        "region_id, specialty_id, user_allocation, initial_allocation, session_id"
+        "region_id, specialty_id, final_allocation, initial_allocation, session_id"
     ).execute()
     demands = []
     session_id_from_demand = None
@@ -202,7 +212,7 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
         rid, sid = str(row["region_id"]), str(row["specialty_id"])
         if demand_filter and (rid, sid) not in demand_filter:
             continue
-        qty = row.get("user_allocation")
+        qty = row.get("final_allocation")
         if qty is None:
             qty = row.get("initial_allocation") or 0
         if qty > 0:
@@ -731,7 +741,7 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
                 'suggested_reduction': suggestion.get('suggested_reduction'),
                 'suggestion_reason': suggestion.get('reason'),
                 'highlight_color': suggestion.get('highlight_color'),
-                'final_allocation': demand.get('user_allocation') or demand.get('initial_allocation', 0),
+                'final_allocation': _effective_allocation(demand),
                 'review_status': 'reviewed' if demand.get('user_allocation') is not None else 'pending'
             })
         
@@ -739,7 +749,7 @@ async def get_review_table(session_id: str, page: int = 1, page_size: int = 50):
         # Calculate summary statistics
         all_demands = supabase.table("demand_requests").select("*").eq("session_id", session_id).execute()
         total_initial = sum(d.get('initial_allocation', 0) for d in all_demands.data)
-        total_final = sum(d.get('user_allocation') or d.get('initial_allocation', 0) for d in all_demands.data)
+        total_final = sum(_effective_allocation(d) for d in all_demands.data)
         reviewed_count = sum(1 for d in all_demands.data if d.get('user_allocation') is not None)
         
         return {
@@ -821,8 +831,8 @@ async def get_full_review_table(session_id: str):
                 'graduate_year': graduate_year,
                 'initial_allocation': demand.get('initial_allocation', 0),
                 'user_allocation': demand.get('user_allocation'),
-                'final_allocation': demand.get('user_allocation') or demand.get('initial_allocation', 0),
-                'deduction_amount': demand.get('initial_allocation', 0) - (demand.get('user_allocation') or demand.get('initial_allocation', 0)),
+                'final_allocation': _effective_allocation(demand),
+                'deduction_amount': demand.get('initial_allocation', 0) - _effective_allocation(demand),
                 'notes': demand.get('notes', ''),
                 'suggestion_type': suggestion.get('suggestion_type'),
                 'suggested_reduction': suggestion.get('suggested_reduction'),
@@ -898,15 +908,18 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
         if len(quotas) != len(demands):
             raise HTTPException(status_code=500, detail="Allocation length mismatch")
 
-        # Use approved allocations (user_allocation) when set; only apply priority to unapproved rows
+        # Use final_allocation when set; only apply priority to rows without final_allocation
         for i, demand in enumerate(demands):
-            if demand.get("initial_allocation") is not None:
-                quotas[i] = int(demand["initial_allocation"])
+            if demand.get("final_allocation") is not None:
+                quotas[i] = int(demand["final_allocation"])
 
         demand_ids = [d["id"] for d in demands]
         for i, demand in enumerate(demands):
             new_alloc = quotas[i]
-            supabase.table("demand_requests").update({"initial_allocation": new_alloc}).eq("id", demand["id"]).execute()
+            supabase.table("demand_requests").update({
+                "initial_allocation": new_alloc,
+                "final_allocation": new_alloc,
+            }).eq("id", demand["id"]).execute()
 
         for sid in demand_ids:
             supabase.table("adjustment_suggestions").delete().eq("demand_request_id", sid).execute()
@@ -955,12 +968,13 @@ async def adjust_allocation(demand_id: str, request: AdjustAllocationRequest):
     Adjust a single allocation
     """
     try:
+        new_alloc = request.new_allocation
         update_data = {
-            "user_allocation": request.new_allocation,
+            "user_allocation": new_alloc,
+            "final_allocation": new_alloc if new_alloc is not None else None,
             "notes": request.notes,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
-        
         result = supabase.table("demand_requests").update(update_data).eq("id", demand_id).execute()
         
         if not result.data:
@@ -989,8 +1003,10 @@ async def bulk_adjust_allocations(request: BulkAdjustRequest):
         
         for adj in request.adjustments:
             try:
+                new_alloc = adj.new_allocation
                 result = supabase.table("demand_requests").update({
-                    "user_allocation": adj.new_allocation,
+                    "user_allocation": new_alloc,
+                    "final_allocation": new_alloc if new_alloc is not None else None,
                     "notes": adj.notes,
                     "updated_at": datetime.now(timezone.utc).isoformat()
                 }).eq("id", adj.demand_request_id).execute()
@@ -1112,9 +1128,8 @@ async def get_session_summary(session_id: str):
         total_deficit = sum(d.get('historical_deficit', 0) for d in demands)
         total_requested = sum(d.get('current_request', 0) for d in demands)
         total_initial = sum(d.get('initial_allocation', 0) for d in demands)
-        total_final = sum(d.get('user_allocation') or d.get('initial_allocation', 0) for d in demands)
-        # Since edits are stored in 'initial_allocation', not 'user_allocation', deductions should always be zero
-        total_deductions = 0
+        total_final = sum(_effective_allocation(d) for d in demands)
+        total_deductions = sum(d.get('initial_allocation', 0) - _effective_allocation(d) for d in demands)
         
         reviewed_count = sum(1 for d in demands if d.get('user_allocation') is not None)
         
@@ -1131,7 +1146,7 @@ async def get_session_summary(session_id: str):
                 }
             by_region[region]['deficit'] += d.get('historical_deficit', 0)
             by_region[region]['requested'] += d.get('current_request', 0)
-            by_region[region]['allocated'] += d.get('user_allocation') or d.get('initial_allocation', 0)
+            by_region[region]['allocated'] += _effective_allocation(d)
             by_region[region]['count'] += 1
         
         # Group by specialty
@@ -1147,7 +1162,7 @@ async def get_session_summary(session_id: str):
                 }
             by_specialty[specialty]['deficit'] += d.get('historical_deficit', 0)
             by_specialty[specialty]['requested'] += d.get('current_request', 0)
-            by_specialty[specialty]['allocated'] += d.get('user_allocation') or d.get('initial_allocation', 0)
+            by_specialty[specialty]['allocated'] += _effective_allocation(d)
             by_specialty[specialty]['count'] += 1
         
         return {
@@ -1201,8 +1216,8 @@ async def export_session(session_id: str, format: str = "json"):
                 "current_request": d['current_request'],
                 "max_need": max(d.get('historical_deficit') or 0, d.get('current_request') or 0),
                 "initial_allocation": d.get('initial_allocation', 0),
-                "final_allocation": d.get('user_allocation') or d.get('initial_allocation', 0),
-                "deduction": d.get('initial_allocation', 0) - (d.get('user_allocation') or d.get('initial_allocation', 0)),
+                "final_allocation": _effective_allocation(d),
+                "deduction": d.get('initial_allocation', 0) - _effective_allocation(d),
                 "notes": d.get('notes', '')
             })
         
