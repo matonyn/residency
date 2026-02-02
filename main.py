@@ -52,6 +52,25 @@ class UpsertUniversityAllocationsRequest(BaseModel):
     specialty_id: str
     assignments: List[dict]
 
+class RunAllocationRequest(BaseModel):
+    priority: str  # historic_deficit | requested_amount | last_year_data
+    total_grants: Optional[int] = None
+
+class AdjustAllocationRequest(BaseModel):
+    new_allocation: Optional[int] = None
+    notes: Optional[str] = None
+
+class BulkAdjustmentItem(BaseModel):
+    demand_request_id: str
+    new_allocation: Optional[int] = None
+    notes: Optional[str] = None
+
+class BulkAdjustRequest(BaseModel):
+    adjustments: List[BulkAdjustmentItem]
+
+class FinalizeSessionRequest(BaseModel):
+    finalized_by: Optional[str] = None
+
 # --- Helper Functions ---
 
 def _normalize_name_for_lookup(name: str) -> str:
@@ -62,6 +81,31 @@ def _normalize_name_for_lookup(name: str) -> str:
     s = re.sub(r"^\s*(г\.|город|нао|нуо|тоо)\s*", "", s) # Remove prefixes
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+def _normalize_specialty_for_graduate_lookup(specialty_name: str) -> str:
+    """Normalize specialty name for yearly_graduates lookup."""
+    return _normalize_name_for_lookup(specialty_name or "")
+
+def allocation_by_priority(priority: str, rows: List[dict]) -> List[int]:
+    """
+    Set initial allocation per row from the chosen priority.
+    historic_deficit -> historical_deficit, requested_amount -> current_request, last_year_data -> graduate_count.
+    Returns list of allocations (same order as rows).
+    """
+    result = []
+    for r in rows:
+        hist = max(0, int(r.get("historical_deficit") or 0))
+        req = max(0, int(r.get("current_request") or 0))
+        grad = max(0, int(r.get("graduate_count") or 0))
+        if priority == "historic_deficit":
+            result.append(hist)
+        elif priority == "requested_amount":
+            result.append(req)
+        elif priority == "last_year_data":
+            result.append(grad)
+        else:
+            result.append(max(hist, req, grad))
+    return result
 
 def _get_db_maps(supabase_client):
     """Fetch Regions, Specialties, and Universities to map Names -> IDs."""
@@ -337,6 +381,40 @@ def parse_excel_full_allocation(file_content, session_id, supabase_client):
             }, on_conflict="university_id, specialty_id").execute()
 
     return len(demands_to_insert), len(capacities_to_upsert)
+
+
+async def process_uploaded_excel(content: bytes, session_id: str, supabase_client) -> dict:
+    """
+    Process uploaded Excel: parse demands and capacities, insert demands.
+    Returns {success, demands_inserted, suggestions_generated, error?}.
+    """
+    try:
+        d_count, c_count = parse_excel_full_allocation(content, session_id, supabase_client)
+        return {"success": True, "demands_inserted": d_count, "suggestions_generated": 0}
+    except Exception as e:
+        return {"success": False, "error": str(e), "demands_inserted": 0, "suggestions_generated": 0}
+
+
+async def process_uploaded_graduates(
+    content: bytes,
+    supabase_client,
+    session_id: Optional[str] = None,
+    default_year: Optional[int] = None,
+    file_name: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    replace_years: Optional[List[int]] = None,
+) -> dict:
+    """
+    Process uploaded Excel with graduate counts (year, specialty, graduate_count).
+    Returns {success, inserted, total_rows, metadata, error?}.
+    """
+    try:
+        # Stub: no parser in this file for graduate Excel; return empty success.
+        # Replace with actual parse + insert into yearly_graduates when available.
+        return {"success": True, "inserted": 0, "total_rows": 0, "metadata": {}}
+    except Exception as e:
+        return {"success": False, "error": str(e), "inserted": 0, "total_rows": 0, "metadata": {}}
+
 
 # --- Routes ---
 
