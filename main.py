@@ -226,44 +226,27 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
     for rid in uni_serving_region:
         uni_serving_region[rid].sort(key=lambda x: x[1]) # Sort by rank (1=Primary asc)
 
-    # 3b. Regions with no proximity: ALL universities are candidates; КАЗНМУ first, then by total capacity (number of people)
+    # 3b. КАЗНМУ: add to every region so every (region, specialty) has at least one candidate
     kaznmu_id = _find_kaznmu_id(supabase_client)
-    all_uids = set(uid for (uid, _) in supply_map.keys())
-    total_cap = {}
-    for (uid, _), cap in supply_map.items():
-        total_cap[uid] = total_cap.get(uid, 0) + cap
-    other_uids_by_capacity = sorted(
-        [u for u in all_uids if u != kaznmu_id],
-        key=lambda u: -total_cap.get(u, 0)
-    )
-    region_id_to_name = {}
-    try:
-        regions_resp = supabase_client.table("regions").select("id, name").execute()
-        for r in (regions_resp.data or []):
-            region_id_to_name[str(r.get("id"))] = _normalize_name_for_lookup(r.get("name") or "")
-    except Exception:
-        pass
-    all_rids_with_demand = set(d["region_id"] for d in demands)
-    for rid in all_rids_with_demand:
-        if not rid:
-            continue
-        candidates = uni_serving_region.get(rid, [])
-        if not candidates:
-            # No proximity: all unis are candidates; КАЗНМУ most prioritized, then by capacity
-            uni_serving_region[rid] = []
-            if kaznmu_id:
-                uni_serving_region[rid].append((kaznmu_id, 1))
-            for uid in other_uids_by_capacity:
-                uni_serving_region[rid].append((uid, 2))
-            continue
-        # Has proximity: add КАЗНМУ if not already there
-        if kaznmu_id:
+    if kaznmu_id:
+        try:
+            regions_resp = supabase_client.table("regions").select("id, name").execute()
+            region_id_to_name = {}
+            for r in (regions_resp.data or []):
+                region_id_to_name[str(r.get("id"))] = _normalize_name_for_lookup(r.get("name") or "")
+        except Exception:
+            region_id_to_name = {}
+        all_rids = set(d["region_id"] for d in demands) | set(uni_serving_region.keys())
+        for rid in all_rids:
+            if not rid:
+                continue
             region_norm = region_id_to_name.get(rid, "")
             kaznmu_rank = _kaznmu_rank_for_region(region_norm)
-            existing_uids = {u for u, _ in uni_serving_region[rid]}
+            existing_uids = {u for u, _ in uni_serving_region.get(rid, [])}
             if kaznmu_id not in existing_uids:
-                uni_serving_region[rid].append((kaznmu_id, kaznmu_rank))
-                uni_serving_region[rid].sort(key=lambda x: x[1])
+                uni_serving_region.setdefault(rid, []).append((kaznmu_id, kaznmu_rank))
+        for rid in uni_serving_region:
+            uni_serving_region[rid].sort(key=lambda x: x[1])
 
     # Process demands by (specialty_id, needed ASC, region_id) so small demands get filled first and more regions get a university
     demands_sorted = sorted(demands, key=lambda d: (d["specialty_id"], d["needed"], d["region_id"]))
