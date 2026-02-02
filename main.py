@@ -115,6 +115,44 @@ def allocation_by_priority(priority: str, rows: List[dict]) -> List[int]:
 
 # --- Geographic University Allocation (demand-first, priority per region) ---
 
+# Allocation share caps per tier (as fraction of demand N for each (region, specialty))
+# Primary 60–95%, Secondary 5–30%, Tertiary 1–10%, Specialized 1–5%
+ALLOCATION_CAP_PRIMARY = 0.95
+ALLOCATION_CAP_SECONDARY = 0.30
+ALLOCATION_CAP_TERTIARY = 0.10
+ALLOCATION_CAP_SPECIALIZED = 0.05
+
+# КАЗНМУ (National University): considered for ALL regions with region-specific priority.
+# Primary: г. Алматы, Жетысуская, Алматинская; Secondary: Жамбылская, Туркестанская, Кызылординская, г. Шымкент; Tertiary: all others
+KAZNMU_PRIMARY_REGION_KEYWORDS = ("алматы", "жетысуская", "алматинская")  # normalized lowercase
+KAZNMU_SECONDARY_REGION_KEYWORDS = ("жамбылская", "туркестанская", "кызылординская", "шымкент")
+
+
+def _find_kaznmu_university_id(supabase_client):
+    """Return university id for КАЗНМУ (name contains КазНМУ or Асфендиярова), or None."""
+    try:
+        resp = supabase_client.table("universities").select("id, name").execute()
+        for row in (resp.data or []):
+            name = (row.get("name") or "").strip().lower()
+            if "казнму" in name or "асфендиярова" in name:
+                return str(row.get("id"))
+    except Exception:
+        pass
+    return None
+
+
+def _region_kaznmu_rank(region_name_normalized: str) -> int:
+    """Return priority rank for КАЗНМУ in this region: 1=primary, 2=secondary, 3=tertiary."""
+    if not region_name_normalized:
+        return 3
+    r = region_name_normalized.strip().lower()
+    if any(kw in r for kw in KAZNMU_PRIMARY_REGION_KEYWORDS):
+        return 1
+    if any(kw in r for kw in KAZNMU_SECONDARY_REGION_KEYWORDS):
+        return 2
+    return 3
+
+
 def _compute_geo_university_allocations(
     supabase_client,
     demand_filter: Optional[Set[Tuple[str, str]]] = None,
@@ -174,23 +212,59 @@ def _compute_geo_university_allocations(
     for rid in region_universities:
         region_universities[rid].sort(key=lambda x: (x[1], x[0]))
 
-    # --- 4. Process by (specialty_id, region_id): each specialty shared across regions ---
+    # --- 3b. КАЗНМУ (National University): consider for ALL regions with region-specific priority ---
+    kaznmu_id = _find_kaznmu_university_id(supabase_client)
+    if kaznmu_id:
+        try:
+            regions_resp = supabase_client.table("regions").select("id, name").execute()
+            region_id_to_name = {}
+            for r in (regions_resp.data or []):
+                region_id_to_name[str(r.get("id"))] = _normalize_name_for_lookup(r.get("name") or "")
+        except Exception:
+            region_id_to_name = {}
+        all_rids = set(demand_map.keys()) | set(region_universities.keys())
+        for rid in all_rids:
+            if not rid:
+                continue
+            region_norm = region_id_to_name.get(rid, "")
+            kaznmu_rank = _region_kaznmu_rank(region_norm)
+            existing_uids = {u for u, _ in region_universities.get(rid, [])}
+            if kaznmu_id not in existing_uids:
+                region_universities.setdefault(rid, []).append((kaznmu_id, kaznmu_rank))
+        for rid in region_universities:
+            region_universities[rid].sort(key=lambda x: (x[1], x[0]))
+
+    # --- 4. Process by (specialty_id, region_id) with per-tier allocation caps ---
+    # Primary 60–95%, Secondary 5–30%, Tertiary 1–10%, Specialized 1–5% of demand N per (region, specialty)
     demand_keys = sorted(demand_map.keys(), key=lambda x: (x[1], x[0]))
     assignments = []
+    tier_caps = {
+        1: ALLOCATION_CAP_PRIMARY,
+        2: ALLOCATION_CAP_SECONDARY,
+        3: ALLOCATION_CAP_TERTIARY,
+        4: ALLOCATION_CAP_SPECIALIZED,
+    }
     for (rid, sid) in demand_keys:
         needed = demand_map.get((rid, sid), 0)
         if needed <= 0:
             continue
-        for uid, _ in region_universities.get(rid, []):
+        initial_n = needed
+        tier_used = {1: 0, 2: 0, 3: 0, 4: 0}
+        for uid, rank in region_universities.get(rid, []):
             if needed <= 0:
                 break
             available = supply_map.get((uid, sid), 0)
             if available <= 0:
                 continue
-            take = min(needed, available)
+            cap_for_tier = tier_caps.get(rank, 1.0) * initial_n
+            cap_left = max(0, cap_for_tier - tier_used.get(rank, 0))
+            take = min(needed, available, int(cap_left))
+            if take <= 0:
+                continue
             assignments.append({"region_id": rid, "specialty_id": sid, "university_id": uid, "allocated_count": take})
             supply_map[(uid, sid)] = available - take
             needed -= take
+            tier_used[rank] = tier_used.get(rank, 0) + take
         demand_map[(rid, sid)] = needed
 
     # --- 5. Fallback: still unmet (region, specialty) -> any uni with capacity for that specialty ---
