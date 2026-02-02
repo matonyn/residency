@@ -76,6 +76,7 @@ class CreateSessionRequest(BaseModel):
 class GeoFilterRequest(BaseModel):
     region_id: Optional[str] = None
     specialty_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 class UpsertUniversityAllocationsRequest(BaseModel):
     region_id: str
@@ -171,13 +172,15 @@ def _get_db_maps(supabase_client):
 
 # --- CORE LOGIC: Strict Waterfall Allocation ---
 
-def _compute_geo_university_allocations(supabase_client, demand_filter: Optional[Set[Tuple[str, str]]] = None):
+def _compute_geo_university_allocations(supabase_client, demand_filter: Optional[Set[Tuple[str, str]]] = None, session_id: Optional[str] = None):
     """
     Allocates grants strictly based on the SQL prioritization logic:
     1. Primary (Local) -> Fill first.
     2. Secondary (Regional Neighbors) -> Fill second.
     3. Tertiary (National: KazNMU, MUA, etc.) -> Fill third.
     4. Specialized -> Fill last.
+    Uses approved allocations (user_allocation) when set, else initial_allocation.
+    When session_id is provided, only demands for that session are used.
     """
     
     # 1. Fetch Supply: Capacity per (Uni, Specialty)
@@ -187,21 +190,49 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
         k = (str(row["university_id"]), str(row["specialty_id"]))
         supply_map[k] = int(row["capacity"] or 0)
 
-    # 2. Fetch Demand: Requests per (Region, Specialty)
-    demands_resp = supabase_client.table("demand_requests").select("region_id, specialty_id, user_allocation, initial_allocation").execute()
+    # 2. Fetch Demand: Requests per (Region, Specialty); prefer user_allocation (approved), cap by session total_budget
+    demands_resp = supabase_client.table("demand_requests").select(
+        "region_id, specialty_id, user_allocation, initial_allocation, session_id"
+    ).execute()
     demands = []
+    session_id_from_demand = None
     for row in (demands_resp.data or []):
+        if session_id and str(row.get("session_id") or "") != str(session_id):
+            continue
         rid, sid = str(row["region_id"]), str(row["specialty_id"])
-        # Filter if requested
         if demand_filter and (rid, sid) not in demand_filter:
             continue
-            
         qty = row.get("user_allocation")
         if qty is None:
             qty = row.get("initial_allocation") or 0
-        
         if qty > 0:
+            if row.get("session_id"):
+                session_id_from_demand = str(row["session_id"])
             demands.append({"region_id": rid, "specialty_id": sid, "needed": int(qty)})
+    total_budget = None
+    session_for_budget = session_id or session_id_from_demand
+    if session_for_budget:
+        try:
+            sess = supabase_client.table("allocation_sessions").select("total_budget").eq(
+                "id", session_for_budget
+            ).execute()
+            if sess.data and len(sess.data) > 0 and (sess.data[0].get("total_budget") or 0) > 0:
+                total_budget = int(sess.data[0]["total_budget"])
+        except Exception:
+            pass
+    if total_budget is not None and total_budget > 0:
+        total_needed = sum(d["needed"] for d in demands)
+        if total_needed > total_budget:
+            cap = total_budget
+            factor = cap / total_needed
+            for d in demands:
+                d["needed"] = int(d["needed"] * factor)
+            remainder = cap - sum(d["needed"] for d in demands)
+            if remainder > 0:
+                with_frac = [(i, d["needed"] * factor - int(d["needed"] * factor)) for i, d in enumerate(demands)]
+                with_frac.sort(key=lambda x: -x[1])
+                for j in range(min(remainder, len(with_frac))):
+                    demands[with_frac[j][0]]["needed"] += 1
 
     # 3. Fetch Matrix: Proximity Priorities (The Source of Truth)
     # This table assumes the User's SQL has been run.
@@ -226,44 +257,27 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
     for rid in uni_serving_region:
         uni_serving_region[rid].sort(key=lambda x: x[1]) # Sort by rank (1=Primary asc)
 
-    # 3b. Regions with no proximity: ALL universities are candidates; КАЗНМУ first, then by total capacity (number of people)
+    # 3b. КАЗНМУ: add to every region so every (region, specialty) has at least one candidate
     kaznmu_id = _find_kaznmu_id(supabase_client)
-    all_uids = set(uid for (uid, _) in supply_map.keys())
-    total_cap = {}
-    for (uid, _), cap in supply_map.items():
-        total_cap[uid] = total_cap.get(uid, 0) + cap
-    other_uids_by_capacity = sorted(
-        [u for u in all_uids if u != kaznmu_id],
-        key=lambda u: -total_cap.get(u, 0)
-    )
-    region_id_to_name = {}
-    try:
-        regions_resp = supabase_client.table("regions").select("id, name").execute()
-        for r in (regions_resp.data or []):
-            region_id_to_name[str(r.get("id"))] = _normalize_name_for_lookup(r.get("name") or "")
-    except Exception:
-        pass
-    all_rids_with_demand = set(d["region_id"] for d in demands)
-    for rid in all_rids_with_demand:
-        if not rid:
-            continue
-        candidates = uni_serving_region.get(rid, [])
-        if not candidates:
-            # No proximity: all unis are candidates; КАЗНМУ most prioritized, then by capacity
-            uni_serving_region[rid] = []
-            if kaznmu_id:
-                uni_serving_region[rid].append((kaznmu_id, 1))
-            for uid in other_uids_by_capacity:
-                uni_serving_region[rid].append((uid, 2))
-            continue
-        # Has proximity: add КАЗНМУ if not already there
-        if kaznmu_id:
+    if kaznmu_id:
+        try:
+            regions_resp = supabase_client.table("regions").select("id, name").execute()
+            region_id_to_name = {}
+            for r in (regions_resp.data or []):
+                region_id_to_name[str(r.get("id"))] = _normalize_name_for_lookup(r.get("name") or "")
+        except Exception:
+            region_id_to_name = {}
+        all_rids = set(d["region_id"] for d in demands) | set(uni_serving_region.keys())
+        for rid in all_rids:
+            if not rid:
+                continue
             region_norm = region_id_to_name.get(rid, "")
             kaznmu_rank = _kaznmu_rank_for_region(region_norm)
-            existing_uids = {u for u, _ in uni_serving_region[rid]}
+            existing_uids = {u for u, _ in uni_serving_region.get(rid, [])}
             if kaznmu_id not in existing_uids:
-                uni_serving_region[rid].append((kaznmu_id, kaznmu_rank))
-                uni_serving_region[rid].sort(key=lambda x: x[1])
+                uni_serving_region.setdefault(rid, []).append((kaznmu_id, kaznmu_rank))
+        for rid in uni_serving_region:
+            uni_serving_region[rid].sort(key=lambda x: x[1])
 
     # Process demands by (specialty_id, needed ASC, region_id) so small demands get filled first and more regions get a university
     demands_sorted = sorted(demands, key=lambda d: (d["specialty_id"], d["needed"], d["region_id"]))
@@ -405,13 +419,15 @@ def parse_excel_full_allocation(file_content, session_id, supabase_client):
             try: req = int(req or 0)
             except: req = 0
             
+            max_need = max(hist, req)
             demands_to_insert.append({
                 "session_id": session_id,
                 "region_id": rid,
                 "specialty_id": sid,
                 "historical_deficit": hist,
                 "current_request": req,
-                "initial_allocation": max(hist, req) # Default logic
+                "initial_allocation": max_need,
+                "max_need": max_need,
             })
             
         # Extract Capacities (Supply) from University Columns
@@ -530,8 +546,8 @@ async def compute_geo_university_allocations(
         filter_set = None
         if body and body.region_id and body.specialty_id:
             filter_set = {(body.region_id, body.specialty_id)}
-            
-        assignments = _compute_geo_university_allocations(supabase, filter_set)
+        session_id = body.session_id if body else None
+        assignments = _compute_geo_university_allocations(supabase, demand_filter=filter_set, session_id=session_id)
         
         if save and assignments:
             # Clean old assignments if filtering, or truncate if full run?
@@ -882,6 +898,11 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
         if len(quotas) != len(demands):
             raise HTTPException(status_code=500, detail="Allocation length mismatch")
 
+        # Use approved allocations (user_allocation) when set; only apply priority to unapproved rows
+        for i, demand in enumerate(demands):
+            if demand.get("initial_allocation") is not None:
+                quotas[i] = int(demand["initial_allocation"])
+
         demand_ids = [d["id"] for d in demands]
         for i, demand in enumerate(demands):
             new_alloc = quotas[i]
@@ -1092,7 +1113,8 @@ async def get_session_summary(session_id: str):
         total_requested = sum(d.get('current_request', 0) for d in demands)
         total_initial = sum(d.get('initial_allocation', 0) for d in demands)
         total_final = sum(d.get('user_allocation') or d.get('initial_allocation', 0) for d in demands)
-        total_deductions = sum(d.get('initial_allocation', 0) - (d.get('user_allocation') or d.get('initial_allocation', 0)) for d in demands)
+        # Since edits are stored in 'initial_allocation', not 'user_allocation', deductions should always be zero
+        total_deductions = 0
         
         reviewed_count = sum(1 for d in demands if d.get('user_allocation') is not None)
         
@@ -1382,7 +1404,8 @@ async def compute_geo_university_allocations(
         demand_filter = None
         if body and body.region_id and body.specialty_id:
             demand_filter = {(body.region_id, body.specialty_id)}
-        assignments = _compute_geo_university_allocations(supabase, demand_filter=demand_filter)
+        session_id = body.session_id if body else None
+        assignments = _compute_geo_university_allocations(supabase, demand_filter=demand_filter, session_id=session_id)
         if save and assignments:
             try:
                 # Delete existing geo assignments for (region, specialty) pairs we're recomputing
