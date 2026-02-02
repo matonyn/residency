@@ -189,7 +189,7 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
     2. Secondary (Regional Neighbors) -> Fill second.
     3. Tertiary (National: KazNMU, MUA, etc.) -> Fill third.
     4. Specialized -> Fill last.
-    Uses final_allocation as the effective allocation; falls back to initial_allocation if not set.
+    Uses initial_allocation for demand quantity (algorithm output before user edits).
     When session_id is provided, only demands for that session are used.
     """
     
@@ -200,9 +200,9 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
         k = (str(row["university_id"]), str(row["specialty_id"]))
         supply_map[k] = int(row["capacity"] or 0)
 
-    # 2. Fetch Demand: Requests per (Region, Specialty); use final_allocation, cap by session total_budget
+    # 2. Fetch Demand: Requests per (Region, Specialty); use initial_allocation, cap by session total_budget
     demands_resp = supabase_client.table("demand_requests").select(
-        "region_id, specialty_id, final_allocation, initial_allocation, session_id"
+        "region_id, specialty_id, initial_allocation, session_id"
     ).execute()
     demands = []
     session_id_from_demand = None
@@ -212,9 +212,7 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
         rid, sid = str(row["region_id"]), str(row["specialty_id"])
         if demand_filter and (rid, sid) not in demand_filter:
             continue
-        qty = row.get("final_allocation")
-        if qty is None:
-            qty = row.get("initial_allocation") or 0
+        qty = row.get("initial_allocation") or 0
         if qty > 0:
             if row.get("session_id"):
                 session_id_from_demand = str(row["session_id"])
