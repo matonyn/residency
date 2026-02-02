@@ -187,46 +187,21 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
         k = (str(row["university_id"]), str(row["specialty_id"]))
         supply_map[k] = int(row["capacity"] or 0)
 
-    # 2. Fetch Demand: Requests per (Region, Specialty); cap total by session total_budget if set
-    demands_resp = supabase_client.table("demand_requests").select(
-        "region_id, specialty_id, user_allocation, initial_allocation, session_id"
-    ).execute()
+    # 2. Fetch Demand: Requests per (Region, Specialty)
+    demands_resp = supabase_client.table("demand_requests").select("region_id, specialty_id, user_allocation, initial_allocation").execute()
     demands = []
-    session_id_from_demand = None
     for row in (demands_resp.data or []):
         rid, sid = str(row["region_id"]), str(row["specialty_id"])
+        # Filter if requested
         if demand_filter and (rid, sid) not in demand_filter:
             continue
+            
         qty = row.get("user_allocation")
         if qty is None:
             qty = row.get("initial_allocation") or 0
+        
         if qty > 0:
-            if row.get("session_id"):
-                session_id_from_demand = str(row["session_id"])
             demands.append({"region_id": rid, "specialty_id": sid, "needed": int(qty)})
-    total_budget = None
-    if session_id_from_demand:
-        try:
-            sess = supabase_client.table("allocation_sessions").select("total_budget").eq(
-                "id", session_id_from_demand
-            ).execute()
-            if sess.data and len(sess.data) > 0 and (sess.data[0].get("total_budget") or 0) > 0:
-                total_budget = int(sess.data[0]["total_budget"])
-        except Exception:
-            pass
-    if total_budget is not None and total_budget > 0:
-        total_needed = sum(d["needed"] for d in demands)
-        if total_needed > total_budget:
-            cap = total_budget
-            factor = cap / total_needed
-            for d in demands:
-                d["needed"] = int(d["needed"] * factor)
-            remainder = cap - sum(d["needed"] for d in demands)
-            if remainder > 0:
-                with_frac = [(i, d["needed"] * factor - int(d["needed"] * factor)) for i, d in enumerate(demands)]
-                with_frac.sort(key=lambda x: -x[1])
-                for j in range(min(remainder, len(with_frac))):
-                    demands[with_frac[j][0]]["needed"] += 1
 
     # 3. Fetch Matrix: Proximity Priorities (The Source of Truth)
     # This table assumes the User's SQL has been run.
