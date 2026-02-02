@@ -1,23 +1,16 @@
-"""
-Complete Allocation API with Excel Parser
-Supports both Excel (.xlsx) and PDF uploads
-"""
-
 import os
-import uuid
+import io
+import openpyxl
+import re
 from datetime import datetime, timezone
-from typing import List, Optional, Literal, Set, Tuple
-import sys
-
+from typing import List, Optional, Literal, Set, Tuple, Dict
 from fastapi import FastAPI, HTTPException, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
 # --- Setup ---
-
-# Load environment variables from .env.local
-from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", "..", ".env.local"))
 
 url: str = os.environ.get("SUPABASE_URL")
@@ -34,571 +27,388 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Constants based on User Logic ---
+PRIORITY_ORDER = {
+    "primary": 1,      # 60-95% target
+    "secondary": 2,    # 5-30% target
+    "tertiary": 3,     # 1-10% target (National: KazNMU, MUA, etc.)
+    "specialized": 4,  # 1-5% target
+    "none": 99         # Fallback
+}
 
 # --- Pydantic Models ---
-
 class CreateSessionRequest(BaseModel):
     session_name: str
     year: int
     total_budget: int
     uploaded_by: Optional[str] = "system"
 
-
-class AdjustAllocationRequest(BaseModel):
-    demand_request_id: str
-    new_allocation: int
-    notes: Optional[str] = None
-    changed_by: Optional[str] = "user"
-
-
-class BulkAdjustRequest(BaseModel):
-    adjustments: List[AdjustAllocationRequest]
-
-
-class FinalizeSessionRequest(BaseModel):
-    session_id: str
-    finalized_by: str
-
-
-class RunAllocationRequest(BaseModel):
-    """Run weighted allocation for a session. Default: initial_allocation = max(deficit, request). With priority: distribute total_budget by weights."""
-    priority: Literal["historic_deficit", "requested_amount", "last_year_data"] = "historic_deficit"
-    total_grants: Optional[int] = None  # default: session.total_budget
-
-
-class UniversityAssignmentItem(BaseModel):
-    university_id: str
-    allocated_count: int
-
-
-class UpsertUniversityAllocationsRequest(BaseModel):
-    """Replace all university assignments for one (region, specialty)."""
-    region_id: str
-    specialty_id: str
-    assignments: List[UniversityAssignmentItem]
-
-
 class GeoFilterRequest(BaseModel):
-    """Optional filter to recompute geo allocation for a single (region, specialty) only."""
     region_id: Optional[str] = None
     specialty_id: Optional[str] = None
 
+class UpsertUniversityAllocationsRequest(BaseModel):
+    region_id: str
+    specialty_id: str
+    assignments: List[dict]
 
-# --- Allocation Logic ---
+# --- Helper Functions ---
 
-ALLOCATION_PRIORITIES = ("historic_deficit", "requested_amount", "last_year_data")
-
-
-def allocation_by_priority(priority: str, rows: List[dict]) -> List[int]:
-    """
-    Set initial allocation to the value of the chosen priority per row.
-    No distribution: historic_deficit -> historical_deficit, requested_amount -> current_request, last_year_data -> graduate_count.
-    Returns list of allocations (same order as rows).
-    """
-    if not rows:
-        return []
-    result = []
-    for r in rows:
-        d = max(0, int(r.get("historical_deficit") or 0))
-        req = max(0, int(r.get("current_request") or 0))
-        g = max(0, int(r.get("graduate_count") or 0))
-        if priority == "historic_deficit":
-            result.append(d)
-        elif priority == "requested_amount":
-            result.append(req)
-        elif priority == "last_year_data":
-            result.append(g)
-        else:
-            result.append(max(d, req))
-    return result
-
-
-# --- Geographic University Allocation (demand-first, priority per region) ---
-
-# Allocation share caps per tier (as fraction of demand N for each (region, specialty))
-# Primary 60–95%, Secondary 5–30%, Tertiary 1–10%, Specialized 1–5%
-ALLOCATION_CAP_PRIMARY = 0.95
-ALLOCATION_CAP_SECONDARY = 0.30
-ALLOCATION_CAP_TERTIARY = 0.10
-ALLOCATION_CAP_SPECIALIZED = 0.05
-
-# КАЗНМУ (National University): considered for ALL regions with region-specific priority.
-# Primary: г. Алматы, Жетысуская, Алматинская; Secondary: Жамбылская, Туркестанская, Кызылординская, г. Шымкент; Tertiary: all others
-KAZNMU_PRIMARY_REGION_KEYWORDS = ("алматы", "жетысуская", "алматинская")  # normalized lowercase
-KAZNMU_SECONDARY_REGION_KEYWORDS = ("жамбылская", "туркестанская", "кызылординская", "шымкент")
-
-
-def _find_kaznmu_university_id(supabase_client):
-    """Return university id for КАЗНМУ (name contains КазНМУ or Асфендиярова), or None."""
-    try:
-        resp = supabase_client.table("universities").select("id, name").execute()
-        for row in (resp.data or []):
-            name = (row.get("name") or "").strip().lower()
-            if "казнму" in name or "асфендиярова" in name:
-                return str(row.get("id"))
-    except Exception:
-        pass
-    return None
-
-
-def _region_kaznmu_rank(region_name_normalized: str) -> int:
-    """Return priority rank for КАЗНМУ in this region: 1=primary, 2=secondary, 3=tertiary."""
-    if not region_name_normalized:
-        return 3
-    r = region_name_normalized.strip().lower()
-    if any(kw in r for kw in KAZNMU_PRIMARY_REGION_KEYWORDS):
-        return 1
-    if any(kw in r for kw in KAZNMU_SECONDARY_REGION_KEYWORDS):
-        return 2
-    return 3
-
-
-def _compute_geo_university_allocations(
-    supabase_client,
-    demand_filter: Optional[Set[Tuple[str, str]]] = None,
-) -> List[dict]:
-    """
-    Demand-first allocation so every region gets a fair share.
-    1. Supply: university_specialty_capacity. Demand: demand_requests.
-    2. For each region, build list of universities that serve it, sorted by priority (primary first).
-    3. Process demands by (specialty_id, region_id) so capacity per specialty is shared across regions.
-    4. For each (region, specialty): try universities in that region's priority order until demand is met.
-    5. Fallback: any (region, specialty) still unmet gets capacity from any university that has that specialty.
-    """
-    # --- 1. Supply: (university_id, specialty_id) -> capacity ---
-    cap_resp = supabase_client.table("university_specialty_capacity").select(
-        "university_id, specialty_id, capacity"
-    ).execute()
-    supply_map = {}
-    for row in (cap_resp.data or []):
-        uid = str(row.get("university_id"))
-        sid = str(row.get("specialty_id"))
-        cap = int(row.get("capacity") or 0)
-        if uid and sid and cap > 0:
-            supply_map[(uid, sid)] = cap
-
-    # --- 2. Demand: (region_id, specialty_id) -> amount ---
-    demands_resp = supabase_client.table("demand_requests").select(
-        "id, region_id, specialty_id, initial_allocation, user_allocation"
-    ).execute()
-    raw_demands = demands_resp.data or []
-    if demand_filter:
-        filter_set = {(str(r), str(s)) for r, s in demand_filter}
-        raw_demands = [d for d in raw_demands if (str(d.get("region_id")), str(d.get("specialty_id"))) in filter_set]
-    demand_map = {}
-    for d in raw_demands:
-        rid = str(d.get("region_id"))
-        sid = str(d.get("specialty_id"))
-        if not rid or not sid:
-            continue
-        amt = d.get("user_allocation") if d.get("user_allocation") is not None else d.get("initial_allocation")
-        amt = max(0, int(amt or 0))
-        if amt > 0:
-            demand_map[(rid, sid)] = amt
-
-    # --- 3. Per region: list of (university_id, rank) sorted primary first ---
-    prox_resp = supabase_client.table("university_region_proximity").select(
-        "university_id, region_id, priority"
-    ).execute()
-    priority_rank = {"primary": 1, "secondary": 2, "tertiary": 3, "specialized": 4}
-    region_universities = {}
-    for row in (prox_resp.data or []):
-        uid = str(row.get("university_id"))
-        rid = str(row.get("region_id"))
-        p = (row.get("priority") or "").strip().lower()
-        rank = priority_rank.get(p, 99)
-        if uid and rid:
-            region_universities.setdefault(rid, []).append((uid, rank))
-    for rid in region_universities:
-        region_universities[rid].sort(key=lambda x: (x[1], x[0]))
-
-    # --- 3b. КАЗНМУ (National University): consider for ALL regions with region-specific priority ---
-    kaznmu_id = _find_kaznmu_university_id(supabase_client)
-    if kaznmu_id:
-        try:
-            regions_resp = supabase_client.table("regions").select("id, name").execute()
-            region_id_to_name = {}
-            for r in (regions_resp.data or []):
-                region_id_to_name[str(r.get("id"))] = _normalize_name_for_lookup(r.get("name") or "")
-        except Exception:
-            region_id_to_name = {}
-        all_rids = set(demand_map.keys()) | set(region_universities.keys())
-        for rid in all_rids:
-            if not rid:
-                continue
-            region_norm = region_id_to_name.get(rid, "")
-            kaznmu_rank = _region_kaznmu_rank(region_norm)
-            existing_uids = {u for u, _ in region_universities.get(rid, [])}
-            if kaznmu_id not in existing_uids:
-                region_universities.setdefault(rid, []).append((kaznmu_id, kaznmu_rank))
-        for rid in region_universities:
-            region_universities[rid].sort(key=lambda x: (x[1], x[0]))
-
-    # --- 4. Process by (specialty_id, region_id) with per-tier allocation caps ---
-    # Primary 60–95%, Secondary 5–30%, Tertiary 1–10%, Specialized 1–5% of demand N per (region, specialty)
-    demand_keys = sorted(demand_map.keys(), key=lambda x: (x[1], x[0]))
-    assignments = []
-    tier_caps = {
-        1: ALLOCATION_CAP_PRIMARY,
-        2: ALLOCATION_CAP_SECONDARY,
-        3: ALLOCATION_CAP_TERTIARY,
-        4: ALLOCATION_CAP_SPECIALIZED,
-    }
-    for (rid, sid) in demand_keys:
-        needed = demand_map.get((rid, sid), 0)
-        if needed <= 0:
-            continue
-        initial_n = needed
-        tier_used = {1: 0, 2: 0, 3: 0, 4: 0}
-        for uid, rank in region_universities.get(rid, []):
-            if needed <= 0:
-                break
-            available = supply_map.get((uid, sid), 0)
-            if available <= 0:
-                continue
-            cap_for_tier = tier_caps.get(rank, 1.0) * initial_n
-            cap_left = max(0, cap_for_tier - tier_used.get(rank, 0))
-            take = min(needed, available, int(cap_left))
-            if take <= 0:
-                continue
-            assignments.append({"region_id": rid, "specialty_id": sid, "university_id": uid, "allocated_count": take})
-            supply_map[(uid, sid)] = available - take
-            needed -= take
-            tier_used[rank] = tier_used.get(rank, 0) + take
-        demand_map[(rid, sid)] = needed
-
-    # --- 5. Fallback: still unmet (region, specialty) -> any uni with capacity for that specialty ---
-    unis_by_spec = {}
-    for (uid, sid) in supply_map:
-        unis_by_spec.setdefault(sid, []).append(uid)
-    for sid in unis_by_spec:
-        unis_by_spec[sid].sort()
-    for (rid, sid) in list(demand_map.keys()):
-        needed = demand_map.get((rid, sid), 0)
-        if needed <= 0:
-            continue
-        for uid in unis_by_spec.get(sid, []):
-            if needed <= 0:
-                break
-            available = supply_map.get((uid, sid), 0)
-            if available <= 0:
-                continue
-            take = min(needed, available)
-            assignments.append({"region_id": rid, "specialty_id": sid, "university_id": uid, "allocated_count": take})
-            supply_map[(uid, sid)] = available - take
-            needed -= take
-        demand_map[(rid, sid)] = needed
-
-    # --- 6. Consolidate and return ---
-    out = {}
-    for a in assignments:
-        k = (a["region_id"], a["specialty_id"], a["university_id"])
-        out[k] = out.get(k, 0) + a["allocated_count"]
-    return [{"region_id": r, "specialty_id": s, "university_id": u, "allocated_count": c} for (r, s, u), c in out.items()]
-
-# --- Excel Parser Helper ---
-import asyncio
-import io
-import openpyxl
-
-def parse_excel_demands(file_content):
-    """
-    Parse Excel file and extract demand data rows.
-    Returns a list of dicts for each demand row.
-    """
-    wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
-    ws = wb.active
-    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-    rows = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        row_dict = dict(zip(headers, row))
-        rows.append(row_dict)
-    return rows
-
-
-def _normalize_header(h):
-    """Normalize Excel header for flexible matching."""
-    if h is None:
-        return ""
-    s = str(h).strip().lower().replace(" ", "_").replace("-", "_")
-    return s
-
-
-def _parse_regional_sheet_graduates(wb, sheet_name, default_year):
-    """
-    Parse regional breakdown sheet (no header row).
-    Expected: col 0 = number (specialty block), col 1 = specialty name, col 2 = region, col 3 = deficit, col 4 = request, col 5 = graduate_count.
-    Returns list of { year, region, specialty, graduate_count } or None if sheet is wrong/empty.
-    """
-    try:
-        ws = wb[sheet_name]
-    except Exception:
-        return None
-    current_specialty = None
-    skip_headers = ("емкость вуза, нии", "заявки регионов", "дефицит по рк", "регион", "область", "region", "специальность", "specialty")
-    rows_out = []
-    for row in ws.iter_rows(min_row=1, values_only=True):
-        if not row or len(row) < 6:
-            continue
-        # First cell numeric => specialty header row
-        try:
-            v0 = row[0]
-            if v0 is not None and str(v0).strip() != "":
-                n = float(v0) if not isinstance(v0, (int, float)) else v0
-                if isinstance(n, (int, float)) and (isinstance(n, int) or n == int(n)):
-                    current_specialty = (row[1] or "").strip() if len(row) > 1 else None
-                    if current_specialty:
-                        continue
-        except (ValueError, TypeError):
-            pass
-        region_raw = (row[2] or "").strip() if len(row) > 2 else ""
-        region = str(region_raw).strip()
-        if not region or region.lower() in skip_headers:
-            continue
-        if not current_specialty:
-            continue
-        try:
-            cnt = int(float(row[5])) if len(row) > 5 and row[5] is not None else 0
-        except (TypeError, ValueError):
-            cnt = 0
-        if cnt < 0:
-            cnt = 0
-        rows_out.append({
-            "year": default_year,
-            "region": region,
-            "specialty": current_specialty,
-            "graduate_count": cnt,
-        })
-    return rows_out if rows_out else None
-
-
-def parse_excel_graduates(file_content, sheet_name=None, default_year=None):
-    """
-    Parse Excel file and extract yearly graduate data.
-    Expects columns: year (or use default_year), region, specialty, graduate_count (or graduates/count).
-    Optional: use sheet_name to read a specific sheet (e.g. "Graduates" or "Выпускники"); else first sheet.
-    Returns a list of dicts: { year, region, specialty, graduate_count }.
-    """
-    wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
-    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-    raw_headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-    headers = [_normalize_header(h) for h in raw_headers]
-    # Map common column names to canonical keys
-    year_col = None
-    region_col = None
-    specialty_col = None
-    count_col = None
-    for i, h in enumerate(headers):
-        if h in ("year", "год", "г"):
-            year_col = i
-        elif h in ("region", "регион", "область", "region_name"):
-            region_col = i
-        elif h in ("specialty", "speciality", "специальность", "specialty_name"):
-            specialty_col = i
-        elif h in ("graduate_count", "graduates", "count", "количество", "number", "num", "выпуск"):
-            count_col = i
-    if region_col is None or specialty_col is None or count_col is None:
-        # Fallback: try sheets as regional breakdown (no header, columns: 0=num, 1=specialty, 2=region, 5=graduate_count)
-        if default_year is not None and wb.sheetnames:
-            for name in (wb.sheetnames[1:2] + wb.sheetnames[0:1]):  # try sheet 2 first, then sheet 1
-                fallback = _parse_regional_sheet_graduates(wb, name, default_year)
-                if fallback:
-                    return fallback
-        raise ValueError(
-            "Excel must have columns for region, specialty, and graduate count. "
-            "Accepted names: region/Region, specialty/Specialty, graduate_count/graduates/count/Выпуск. "
-            "Or use the second sheet as regional breakdown (columns: specialty, region, ..., graduate count in col 6)."
-        )
-    rows = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        region = row[region_col] if region_col is not None else None
-        specialty = row[specialty_col] if specialty_col is not None else None
-        count_val = row[count_col] if count_col is not None else None
-        if region is None or specialty is None:
-            continue
-        region = str(region).strip() if region else ""
-        specialty = str(specialty).strip() if specialty else ""
-        if not region or not specialty:
-            continue
-        year_val = default_year
-        if year_col is not None and row[year_col] is not None:
-            try:
-                year_val = int(float(row[year_col]))
-            except (TypeError, ValueError):
-                pass
-        if year_val is None:
-            raise ValueError("Year is required: either include a 'year' column in Excel or pass default_year.")
-        try:
-            graduate_count = int(float(count_val)) if count_val is not None else 0
-        except (TypeError, ValueError):
-            graduate_count = 0
-        rows.append({
-            "year": year_val,
-            "region": region,
-            "specialty": specialty,
-            "graduate_count": max(0, graduate_count),
-        })
-    return rows
-
-def _normalize_name_for_lookup(name):
-    """Normalize name for case-insensitive lookup: strip, lowercase, strip 'г.'/'город' prefix, collapse spaces."""
-    import re
-    s = (name or "").strip().lower()
-    s = re.sub(r"^\s*г\.\s*", "", s)
-    s = re.sub(r"^\s*город\s*", "", s)
+def _normalize_name_for_lookup(name: str) -> str:
+    """Normalize names for reliable DB lookup."""
+    if not name: return ""
+    s = str(name).strip().lower()
+    s = re.sub(r"[«»\"']", "", s) # Remove quotes
+    s = re.sub(r"^\s*(г\.|город|нао|нуо|тоо)\s*", "", s) # Remove prefixes
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
-def _normalize_graduate_key(region_name, specialty_name):
-    """Normalize region|specialty for matching (legacy)."""
-    r = (region_name or "").strip().lower().replace("г.", "").strip()
-    s = (specialty_name or "").strip().lower()
-    return f"{r}|{s}"
-
-
-def _normalize_specialty_for_graduate_lookup(specialty_name):
-    """Normalize specialty name for graduate lookup (per-specialty only)."""
-    return _normalize_name_for_lookup(specialty_name or "")
-
-
-def _get_region_specialty_id_maps(supabase_client):
-    """Fetch regions and specialties from DB; return (normalized_name -> id) for FK resolution (case-insensitive)."""
-    region_map = {}
-    specialty_map = {}
+def _get_db_maps(supabase_client):
+    """Fetch Regions, Specialties, and Universities to map Names -> IDs."""
+    r_map, s_map, u_map = {}, {}, {}
+    
+    # Regions
     try:
-        regions_resp = supabase_client.table("regions").select("id, name").execute()
-        for r in (regions_resp.data or []):
-            name = (r.get("name") or "").strip()
-            if name:
-                region_map[_normalize_name_for_lookup(name)] = r.get("id")
-        specialties_resp = supabase_client.table("specialties").select("id, name").execute()
-        for s in (specialties_resp.data or []):
-            name = (s.get("name") or "").strip()
-            if name:
-                specialty_map[_normalize_name_for_lookup(name)] = s.get("id")
-    except Exception:
-        pass
-    return region_map, specialty_map
+        data = supabase_client.table("regions").select("id, name").execute().data or []
+        for row in data:
+            r_map[_normalize_name_for_lookup(row["name"])] = row["id"]
+    except: pass
 
-
-async def process_uploaded_excel(content, session_id, supabase):
-    """
-    Process uploaded Excel file, insert demands, and generate suggestions.
-    Resolves region/specialty names to region_id/specialty_id when possible so frontend join works.
-    Returns dict with success, counts, and metadata.
-    """
+    # Specialties
     try:
-        demands = parse_excel_demands(content)
-        inserted = 0
-        suggestions = 0
-        metadata = {"columns": list(demands[0].keys()) if demands else []}
-        region_map, specialty_map = _get_region_specialty_id_maps(supabase)
-        for d in demands:
-            hist = int(d.get("historical_deficit") or d.get("Historical Deficit") or 0)
-            req = int(d.get("current_request") or d.get("Current Request") or 0)
-            # Default allocation = max(deficit, request); Excel can override
-            initial = d.get("initial_allocation") or d.get("Initial Allocation")
-            initial_allocation = int(initial) if initial is not None else max(hist, req)
-            region_name = (d.get("region") or d.get("Region") or "").strip() or None
-            specialty_name = (d.get("specialty") or d.get("Specialty") or "").strip() or None
-            region_id = region_map.get(_normalize_name_for_lookup(region_name)) if region_name else None
-            specialty_id = specialty_map.get(_normalize_name_for_lookup(specialty_name)) if specialty_name else None
-            demand_data = {
+        data = supabase_client.table("specialties").select("id, name").execute().data or []
+        for row in data:
+            s_map[_normalize_name_for_lookup(row["name"])] = row["id"]
+    except: pass
+
+    # Universities (Map column headers like "КазНМУ" to DB IDs)
+    try:
+        data = supabase_client.table("universities").select("id, name, short_name").execute().data or []
+        for row in data:
+            uid = row["id"]
+            # Map full name
+            u_map[_normalize_name_for_lookup(row["name"])] = uid
+            # Map short name if exists (e.g. "МУА")
+            if row.get("short_name"):
+                u_map[_normalize_name_for_lookup(row["short_name"])] = uid
+    except: pass
+    
+    return r_map, s_map, u_map
+
+# --- CORE LOGIC: Strict Waterfall Allocation ---
+
+def _compute_geo_university_allocations(supabase_client, demand_filter: Optional[Set[Tuple[str, str]]] = None):
+    """
+    Allocates grants strictly based on the SQL prioritization logic:
+    1. Primary (Local) -> Fill first.
+    2. Secondary (Regional Neighbors) -> Fill second.
+    3. Tertiary (National: KazNMU, MUA, etc.) -> Fill third.
+    4. Specialized -> Fill last.
+    """
+    
+    # 1. Fetch Supply: Capacity per (Uni, Specialty)
+    cap_resp = supabase_client.table("university_specialty_capacity").select("university_id, specialty_id, capacity").execute()
+    supply_map = {} # (uid, sid) -> remaining_capacity
+    for row in (cap_resp.data or []):
+        k = (str(row["university_id"]), str(row["specialty_id"]))
+        supply_map[k] = int(row["capacity"] or 0)
+
+    # 2. Fetch Demand: Requests per (Region, Specialty)
+    demands_resp = supabase_client.table("demand_requests").select("region_id, specialty_id, user_allocation, initial_allocation").execute()
+    demands = []
+    for row in (demands_resp.data or []):
+        rid, sid = str(row["region_id"]), str(row["specialty_id"])
+        # Filter if requested
+        if demand_filter and (rid, sid) not in demand_filter:
+            continue
+            
+        qty = row.get("user_allocation")
+        if qty is None:
+            qty = row.get("initial_allocation") or 0
+        
+        if qty > 0:
+            demands.append({"region_id": rid, "specialty_id": sid, "needed": int(qty)})
+
+    # 3. Fetch Matrix: Proximity Priorities (The Source of Truth)
+    # This table assumes the User's SQL has been run.
+    prox_resp = supabase_client.table("university_region_proximity").select("university_id, region_id, priority").execute()
+    proximity_map = {} # (uid, rid) -> priority_rank (int)
+    
+    # Pre-process priorities
+    uni_serving_region = {} # region_id -> list of (uid, priority_rank)
+    
+    for row in (prox_resp.data or []):
+        uid = str(row["university_id"])
+        rid = str(row["region_id"])
+        p_str = (row["priority"] or "").lower().strip()
+        rank = PRIORITY_ORDER.get(p_str, 99)
+        proximity_map[(uid, rid)] = rank
+        
+        if rid not in uni_serving_region:
+            uni_serving_region[rid] = []
+        uni_serving_region[rid].append((uid, rank))
+
+    # Sort universities for each region by strict rank
+    for rid in uni_serving_region:
+        uni_serving_region[rid].sort(key=lambda x: x[1]) # Sort by rank (1=Primary asc)
+
+    allocations = [] # Result list
+
+    # 4. Allocation Algorithm
+    for demand in demands:
+        rid = demand["region_id"]
+        sid = demand["specialty_id"]
+        needed = demand["needed"]
+        
+        if needed <= 0: continue
+
+        # Get candidates for this region
+        candidates = uni_serving_region.get(rid, [])
+        
+        # Iteration 1: Strict Priority Waterfall
+        # We walk through candidates: Primary first, then Secondary, etc.
+        for uid, rank in candidates:
+            if needed <= 0: break
+            
+            # Check if Uni has capacity for this Specialty
+            cap_key = (uid, sid)
+            available = supply_map.get(cap_key, 0)
+            
+            if available > 0:
+                # Allocating
+                take = min(needed, available)
+                
+                # Update State
+                allocations.append({
+                    "region_id": rid, 
+                    "specialty_id": sid, 
+                    "university_id": uid, 
+                    "allocated_count": take,
+                    "priority_applied": rank
+                })
+                
+                supply_map[cap_key] -= take
+                needed -= take
+
+        # Iteration 2: Fallback (Desperation)
+        # If needed > 0, find ANY university with capacity for this specialty, ignoring region
+        if needed > 0:
+            # Find all unis with capacity for this specialty
+            fallback_unis = [u for u, c in supply_map.items() if u[1] == sid and c > 0]
+            # Sort by capacity desc to fill quickly
+            fallback_unis.sort(key=lambda x: supply_map[x], reverse=True)
+            
+            for (uid, _) in fallback_unis:
+                if needed <= 0: break
+                available = supply_map[(uid, sid)]
+                take = min(needed, available)
+                
+                allocations.append({
+                    "region_id": rid,
+                    "specialty_id": sid,
+                    "university_id": uid,
+                    "allocated_count": take,
+                    "priority_applied": 99 # Fallback
+                })
+                supply_map[(uid, sid)] -= take
+                needed -= take
+
+    # Consolidate results (merge multiple entries for same reg/spec/uni)
+    consolidated = {}
+    for a in allocations:
+        key = (a["region_id"], a["specialty_id"], a["university_id"])
+        consolidated[key] = consolidated.get(key, 0) + a["allocated_count"]
+        
+    final_output = [
+        {"region_id": k[0], "specialty_id": k[1], "university_id": k[2], "allocated_count": v}
+        for k, v in consolidated.items()
+    ]
+    
+    return final_output
+
+# --- Excel Parsers ---
+
+def parse_excel_full_allocation(file_content, session_id, supabase_client):
+    """
+    Parses the 'Svodnaya' style Excel which contains both:
+    1. Demands (Rows)
+    2. University Capacities (Columns like 'КазНМУ', 'МУА')
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
+    ws = wb.active # Assuming first sheet is summary
+    
+    # 1. Map Headers to DB IDs
+    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    r_map, s_map, u_map = _get_db_maps(supabase_client)
+    
+    col_idx_map = {} # col_index -> {type: 'uni'|'meta', id: ...}
+    
+    region_col = None
+    specialty_col = None
+    hist_col = None
+    req_col = None
+    
+    for idx, h in enumerate(headers):
+        h_norm = _normalize_name_for_lookup(str(h))
+        
+        if h_norm in ['регион', 'область', 'region']:
+            region_col = idx
+        elif h_norm in ['специальность', 'specialty']:
+            specialty_col = idx
+        elif h_norm in ['потребность', 'historical_deficit', 'дефицит']:
+            hist_col = idx
+        elif h_norm in ['заявка', 'current_request', 'request']:
+            req_col = idx
+        
+        # Check if header is a University
+        if h_norm in u_map:
+            col_idx_map[idx] = {"type": "uni", "id": u_map[h_norm]}
+    
+    demands_to_insert = []
+    capacities_to_upsert = {} # (uni_id, spec_id) -> capacity
+    
+    # 2. Iterate Rows
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row: continue
+        
+        # Extract Identifiers
+        r_name = row[region_col] if region_col is not None else None
+        s_name = row[specialty_col] if specialty_col is not None else None
+        
+        if not s_name: continue # Specialty is mandatory
+        
+        rid = r_map.get(_normalize_name_for_lookup(r_name)) if r_name else None
+        sid = s_map.get(_normalize_name_for_lookup(s_name))
+        
+        # Insert Demand
+        if rid and sid:
+            hist = row[hist_col] if hist_col is not None else 0
+            req = row[req_col] if req_col is not None else 0
+            try: hist = int(hist or 0)
+            except: hist = 0
+            try: req = int(req or 0)
+            except: req = 0
+            
+            demands_to_insert.append({
                 "session_id": session_id,
+                "region_id": rid,
+                "specialty_id": sid,
                 "historical_deficit": hist,
                 "current_request": req,
-                "initial_allocation": initial_allocation,
-                "notes": d.get("notes") or d.get("Notes") or ""
-            }
-            if region_id is not None:
-                demand_data["region_id"] = region_id
-            if specialty_id is not None:
-                demand_data["specialty_id"] = specialty_id
-            resp = supabase.table("demand_requests").insert(demand_data).execute()
-            if resp.data:
-                inserted += 1
-                dr_id = resp.data[0]["id"]
-                max_need = max(hist, req)
-                # Highlight: red = allocation could be less (over-allocated), yellow = allocation could be higher (under-allocated)
-                if initial_allocation > max_need:
-                    suggestion_data = {"demand_request_id": dr_id, "suggestion_type": "can_reduce", "suggested_reduction": initial_allocation - max_need, "reason": f"Можно уменьшить на {initial_allocation - max_need}", "highlight_color": "red"}
-                elif initial_allocation < max_need:
-                    suggestion_data = {"demand_request_id": dr_id, "suggestion_type": "under_allocated", "suggested_reduction": 0, "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})", "highlight_color": "yellow"}
-                else:
-                    suggestion_data = None
-                if suggestion_data:
-                    supabase.table("adjustment_suggestions").insert(suggestion_data).execute()
-                suggestions += 1
-        return {
-            "success": True,
-            "demands_inserted": inserted,
-            "suggestions_generated": suggestions,
-            "metadata": metadata
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+                "initial_allocation": max(hist, req) # Default logic
+            })
+            
+        # Extract Capacities (Supply) from University Columns
+        # Note: Even if Region is null (total row), we might want capacity. 
+        # But usually capacity is defined per specialty row. 
+        if sid:
+            for idx, cell_val in enumerate(row):
+                if idx in col_idx_map and col_idx_map[idx]["type"] == "uni":
+                    uid = col_idx_map[idx]["id"]
+                    try:
+                        cap = int(cell_val or 0)
+                    except:
+                        cap = 0
+                    
+                    if cap > 0:
+                        # Accumulate capacity for this specialty/uni
+                        # (In case multiple rows have same specialty, usually strictly grouped)
+                        key = (uid, sid)
+                        capacities_to_upsert[key] = capacities_to_upsert.get(key, 0) + cap
 
+    # 3. Perform DB Operations
+    
+    # A. Insert Demands
+    if demands_to_insert:
+        supabase_client.table("demand_requests").insert(demands_to_insert).execute()
+        
+    # B. Upsert Capacities
+    # We clean existing capacities for these specialties to avoid doubling up on re-upload
+    spec_ids = list(set([k[1] for k in capacities_to_upsert.keys()]))
+    if spec_ids:
+        # Note: In a real prod env, be careful deleting. For now, we assume session-based or refresh.
+        # Supabase doesn't support bulk upsert easily without logic, so we iterate or use RPC.
+        # We will iterate for safety here.
+        for (uid, sid), cap in capacities_to_upsert.items():
+            supabase_client.table("university_specialty_capacity").upsert({
+                "university_id": uid,
+                "specialty_id": sid,
+                "capacity": cap
+            }, on_conflict="university_id, specialty_id").execute()
 
-async def process_uploaded_graduates(content, supabase_client, session_id=None, default_year=None, file_name=None, sheet_name=None, replace_years=None):
+    return len(demands_to_insert), len(capacities_to_upsert)
+
+# --- Routes ---
+
+@app.post("/sessions/{session_id}/upload-file")
+async def upload_file(session_id: str, file: UploadFile = File(...)):
     """
-    Process uploaded Excel file with graduate data and upsert into yearly_graduates.
-    Stores per specialty only (year, specialty_id, specialty, graduate_count); aggregates by specialty.
-    replace_years: if set, delete existing rows for those years before insert (re-import).
+    Process Excel: Extracts Demands AND University Capacities.
     """
     try:
-        rows = parse_excel_graduates(content, sheet_name=sheet_name, default_year=default_year)
-        if not rows:
-            return {"success": True, "inserted": 0, "updated": 0, "message": "No rows to import"}
-        # Aggregate by (year, specialty): sum graduate_count
-        by_specialty = {}
-        for r in rows:
-            year = r.get("year")
-            spec = (r.get("specialty") or "").strip()
-            if year is None or not spec:
-                continue
-            key = (year, spec)
-            by_specialty[key] = by_specialty.get(key, 0) + int(r.get("graduate_count") or 0)
-        aggregated = [{"year": y, "specialty": s, "graduate_count": c} for (y, s), c in by_specialty.items()]
-        if replace_years:
-            try:
-                supabase_client.table("yearly_graduates").delete().in_("year", replace_years).execute()
-            except Exception:
-                pass
-        specialty_map = _get_region_specialty_id_maps(supabase_client)[1]
-        inserted = 0
-        for r in aggregated:
-            specialty_name = (r.get("specialty") or "").strip()
-            specialty_id = specialty_map.get(_normalize_name_for_lookup(specialty_name)) if specialty_name else None
-            payload = {
-                "year": r["year"],
-                "specialty": specialty_name or r.get("specialty"),
-                "graduate_count": r["graduate_count"],
-                "source_file_name": file_name,
-                "uploaded_at": datetime.now(timezone.utc).isoformat(),
-            }
-            if specialty_id is not None:
-                payload["specialty_id"] = specialty_id
-            if session_id:
-                payload["session_id"] = session_id
-            result = supabase_client.table("yearly_graduates").upsert(
-                payload,
-                on_conflict="year,specialty_id",
-            ).execute()
-            if result.data:
-                inserted += 1
+        content = await file.read()
+        if not file.filename.endswith(('.xlsx', '.xls')):
+             raise HTTPException(400, "Invalid file format")
+
+        d_count, c_count = parse_excel_full_allocation(content, session_id, supabase)
+        
+        supabase.table("allocation_sessions").update({
+            "source_file_name": file.filename,
+            "status": "in_review"
+        }).eq("id", session_id).execute()
+
         return {
-            "success": True,
-            "inserted": inserted,
-            "total_rows": len(aggregated),
-            "metadata": {"columns_used": ["year", "region", "specialty", "graduate_count"], "aggregated_by": "specialty"},
+            "status": "success", 
+            "demands_inserted": d_count, 
+            "capacities_updated": c_count,
+            "message": "File processed. Demands and University Capacities updated."
         }
-    except ValueError as e:
-        return {"success": False, "error": str(e)}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
 
+@app.post("/university-allocations/geo")
+async def compute_geo_university_allocations(
+    save: bool = False,
+    body: Optional[GeoFilterRequest] = Body(None),
+):
+    """
+    Run the Waterfall Allocation Algorithm using SQL-defined priorities.
+    """
+    try:
+        filter_set = None
+        if body and body.region_id and body.specialty_id:
+            filter_set = {(body.region_id, body.specialty_id)}
+            
+        assignments = _compute_geo_university_allocations(supabase, filter_set)
+        
+        if save and assignments:
+            # Clean old assignments if filtering, or truncate if full run?
+            # Safe approach: Delete for the specific (Region, Specialty) pairs involved
+            pairs = list(set((a["region_id"], a["specialty_id"]) for a in assignments))
+            
+            # Batch delete (simplified for readability, optimize for large datasets)
+            for r, s in pairs:
+                supabase.table("university_allocation_assignments").delete().eq("region_id", r).eq("specialty_id", s).execute()
+                
+            # Batch insert
+            batch_size = 100
+            for i in range(0, len(assignments), batch_size):
+                batch = assignments[i:i+batch_size]
+                supabase.table("university_allocation_assignments").insert(batch).execute()
 
+        return {
+            "status": "success",
+            "assignments": assignments,
+            "count": len(assignments)
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+# ... [Include other endpoints: create_session, review tables, etc. from original code] ...
 # --- API Endpoints ---
 
 @app.post("/sessions/create")
