@@ -211,6 +211,15 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
             supply_map[(uid, str(row["specialty_id"]))] = cap
             unis_with_capacity.add(uid)
 
+    # Pre-index supply by specialty for fast fallback (avoid O(M log M) per demand)
+    supply_by_specialty = {}
+    for (uid, sid), cap in supply_map.items():
+        if sid not in supply_by_specialty:
+            supply_by_specialty[sid] = []
+        supply_by_specialty[sid].append((uid, cap))
+    for sid in supply_by_specialty:
+        supply_by_specialty[sid].sort(key=lambda x: x[1], reverse=True)
+
     # 2. Fetch Demand (Use user_allocation if available)
     demands_resp = supabase_client.table("demand_requests").select(
         "region_id, specialty_id, initial_allocation, user_allocation, session_id"
@@ -307,21 +316,18 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
                         demand["remaining_needed"] -= take
                         tier_limit -= take
 
-        # B. Universal Fallback (Prevent "No Unis" error)
-        # If demand remains, check EVERY university with capacity
+        # B. Universal Fallback (Prevent "No Unis" error) — use pre-indexed list by specialty
         if demand["remaining_needed"] > 0:
-            fallback_unis = [u for u, c in supply_map.items() if u[1] == sid and c > 0]
-            fallback_unis.sort(key=lambda x: supply_map[x], reverse=True)
-            
-            for (uid, _) in fallback_unis:
-                if demand["remaining_needed"] <= 0: break
-                
-                available = supply_map[(uid, sid)]
+            for uid, _ in supply_by_specialty.get(sid, []):
+                if demand["remaining_needed"] <= 0:
+                    break
+                available = supply_map.get((uid, sid), 0)
+                if available <= 0:
+                    continue
                 take = min(demand["remaining_needed"], available)
-                
                 allocations.append({
-                    "region_id": rid, "specialty_id": sid, "university_id": uid, 
-                    "allocated_count": take
+                    "region_id": rid, "specialty_id": sid, "university_id": uid,
+                    "allocated_count": take,
                 })
                 supply_map[(uid, sid)] -= take
                 demand["remaining_needed"] -= take
@@ -1391,10 +1397,13 @@ async def compute_geo_university_allocations(
         assignments = _compute_geo_university_allocations(supabase, demand_filter=demand_filter, session_id=session_id)
         if save and assignments:
             try:
-                # Delete existing geo assignments for (region, specialty) pairs we're recomputing
+                # Delete existing geo assignments in batches (one .or_() per batch to cut round-trips)
                 region_spec_pairs = list(set((a["region_id"], a["specialty_id"]) for a in assignments))
-                for rid, sid in region_spec_pairs:
-                    supabase.table("university_allocation_assignments").delete().eq("region_id", rid).eq("specialty_id", sid).execute()
+                delete_batch_size = 20
+                for i in range(0, len(region_spec_pairs), delete_batch_size):
+                    batch = region_spec_pairs[i : i + delete_batch_size]
+                    or_parts = [f'and(region_id.eq."{rid}",specialty_id.eq."{sid}")' for rid, sid in batch]
+                    supabase.table("university_allocation_assignments").delete().or_(",".join(or_parts)).execute()
                 # Batch insert to avoid N round-trips (was 1 insert per row = very slow)
                 batch_size = 200
                 for i in range(0, len(assignments), batch_size):
