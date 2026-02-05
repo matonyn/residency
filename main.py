@@ -1397,13 +1397,10 @@ async def compute_geo_university_allocations(
         assignments = _compute_geo_university_allocations(supabase, demand_filter=demand_filter, session_id=session_id)
         if save and assignments:
             try:
-                # Delete existing geo assignments in batches (one .or_() per batch to cut round-trips)
+                # Delete existing geo assignments for (region, specialty) pairs we're recomputing
                 region_spec_pairs = list(set((a["region_id"], a["specialty_id"]) for a in assignments))
-                delete_batch_size = 20
-                for i in range(0, len(region_spec_pairs), delete_batch_size):
-                    batch = region_spec_pairs[i : i + delete_batch_size]
-                    or_parts = [f'and(region_id.eq."{rid}",specialty_id.eq."{sid}")' for rid, sid in batch]
-                    supabase.table("university_allocation_assignments").delete().or_(",".join(or_parts)).execute()
+                for rid, sid in region_spec_pairs:
+                    supabase.table("university_allocation_assignments").delete().eq("region_id", rid).eq("specialty_id", sid).execute()
                 # Batch insert to avoid N round-trips (was 1 insert per row = very slow)
                 batch_size = 200
                 for i in range(0, len(assignments), batch_size):
