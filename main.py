@@ -1401,11 +1401,14 @@ async def compute_geo_university_allocations(
                 region_spec_pairs = list(set((a["region_id"], a["specialty_id"]) for a in assignments))
                 for rid, sid in region_spec_pairs:
                     supabase.table("university_allocation_assignments").delete().eq("region_id", rid).eq("specialty_id", sid).execute()
-                # Batch insert to avoid N round-trips (was 1 insert per row = very slow)
+                # Batch upsert to avoid duplicate-key errors and cut round-trips
                 batch_size = 200
                 for i in range(0, len(assignments), batch_size):
                     batch = assignments[i : i + batch_size]
-                    supabase.table("university_allocation_assignments").insert(batch).execute()
+                    supabase.table("university_allocation_assignments").upsert(
+                        batch,
+                        on_conflict="region_id,specialty_id,university_id",
+                    ).execute()
             except Exception as persist_e:
                 return {
                     "status": "success",
