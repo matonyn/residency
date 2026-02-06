@@ -273,6 +273,28 @@ def _fetch_proximity(supabase_client):
     return (supabase_client.table("university_region_proximity").select("university_id, region_id, priority").execute().data or [])
 
 
+def _enrich_assignments_with_university_names(supabase_client, assignments: List[dict]) -> List[dict]:
+    """Add university_name to each assignment. Ids are normalized to str for lookup."""
+    if not assignments:
+        return assignments
+    uid_set = {str(a.get("university_id") or "").strip() for a in assignments if a.get("university_id")}
+    uid_set.discard("")
+    if not uid_set:
+        return [{**a, "university_name": ""} for a in assignments]
+    try:
+        resp = supabase_client.table("universities").select("id, name").in_("id", list(uid_set)).execute()
+        rows = resp.data or []
+        id_to_name = {str(r.get("id") or "").strip(): (r.get("name") or "").strip() for r in rows}
+    except Exception:
+        id_to_name = {}
+    out = []
+    for a in assignments:
+        uid = str(a.get("university_id") or "").strip()
+        name = id_to_name.get(uid) or ""
+        out.append({**a, "university_name": name})
+    return out
+
+
 def _compute_geo_university_allocations(supabase_client, demand_filter: Optional[Set[Tuple[str, str]]] = None, session_id: Optional[str] = None):
     """
     Graph-based geo allocation: max-flow per tier (Dinic). Same semantics as before:
@@ -1217,7 +1239,7 @@ async def list_university_allocations(
 ):
     """
     List university allocation assignments. Optional filters: region_id, specialty_id.
-    Returns list of { region_id, specialty_id, university_id, allocated_count }.
+    Returns list of { region_id, specialty_id, university_id, allocated_count, university_name }.
     """
     try:
         query = supabase.table("university_allocation_assignments").select(
@@ -1229,6 +1251,7 @@ async def list_university_allocations(
             query = query.eq("specialty_id", specialty_id)
         resp = query.execute()
         data = resp.data or []
+        data = _enrich_assignments_with_university_names(supabase, data)
         return {"assignments": data, "count": len(data)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1290,14 +1313,12 @@ async def compute_geo_university_allocations(
         assignments = _compute_geo_university_allocations(supabase, demand_filter=demand_filter, session_id=session_id)
         if save and assignments:
             try:
-                # Delete in batches (one .or_() per batch) to cut round-trips — was 1 delete per pair = very slow
                 region_spec_pairs = list(set((a["region_id"], a["specialty_id"]) for a in assignments))
                 delete_batch_size = 25
                 for i in range(0, len(region_spec_pairs), delete_batch_size):
                     batch = region_spec_pairs[i : i + delete_batch_size]
                     or_parts = [f'and(region_id.eq."{rid}",specialty_id.eq."{sid}")' for rid, sid in batch]
                     supabase.table("university_allocation_assignments").delete().or_(",".join(or_parts)).execute()
-                # Batch upsert to avoid duplicate-key errors and cut round-trips
                 batch_size = 200
                 for i in range(0, len(assignments), batch_size):
                     batch = assignments[i : i + batch_size]
@@ -1306,6 +1327,7 @@ async def compute_geo_university_allocations(
                         on_conflict="region_id,specialty_id,university_id",
                     ).execute()
             except Exception as persist_e:
+                assignments = _enrich_assignments_with_university_names(supabase, assignments)
                 return {
                     "status": "success",
                     "assignments": assignments,
@@ -1313,6 +1335,7 @@ async def compute_geo_university_allocations(
                     "persisted": False,
                     "persist_error": str(persist_e),
                 }
+        assignments = _enrich_assignments_with_university_names(supabase, assignments)
         return {
             "status": "success",
             "assignments": assignments,
