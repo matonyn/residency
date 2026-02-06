@@ -39,7 +39,7 @@ PRIORITY_ORDER = {
 KAZNMU_PRIMARY_KEYWORDS = ("алматы", "жетысуская", "алматинская")
 KAZNMU_SECONDARY_KEYWORDS = ("жамбылская", "туркестанская", "кызылординская", "шымкент")
 
-# КАЗНМУ + МКТУ combined grants cap (total across all regions/specialties)
+# КАЗНМУ + МКТУ: max grants for these two unis *within* the total (e.g. of 2500, at most 650 go to national pool). Not extra.
 NATIONAL_POOL_CAP = 650
 
 
@@ -135,6 +135,7 @@ class UpsertUniversityAllocationsRequest(BaseModel):
 class RunAllocationRequest(BaseModel):
     priority: str  # historic_deficit | requested_amount | last_year_data
     total_grants: Optional[int] = None
+    national_pool_cap: Optional[int] = None
 
 class AdjustAllocationRequest(BaseModel):
     new_allocation: Optional[int] = None
@@ -318,7 +319,7 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
             unis_with_capacity.add(uid)
     supply_keys = sorted(supply_map.keys())
 
-    # 2. Demands with remaining and total
+    # 2. Demands with remaining and total (sum = session grant goal; national pool cap is applied within this total)
     demands = []
     all_region_ids = set()
     for row in demands_data:
@@ -405,7 +406,7 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
                 elif fallback_same_specialty_only:
                     pass  # any uid with same specialty
                 edges.append((demand_start + i, supply_start + j, min(d["remaining_needed"], avail)))
-        # Supply -> sink (or -> pool for КАЗНМУ/МКТУ, then pool -> sink with cap 650)
+        # Supply -> sink (or -> pool for КАЗНМУ/МКТУ, then pool -> sink with national_pool_cap; total flow = demand sum)
         for j in range(n_s):
             uid, sid = supply_keys[j]
             cap = supply_map.get((uid, sid), 0)
@@ -745,11 +746,8 @@ async def get_full_review_table(session_id: str):
 @app.post("/sessions/{session_id}/run-allocation")
 async def run_allocation(session_id: str, request: RunAllocationRequest):
     """
-    Set initial allocations by the chosen priority (no distribution).
-    historic_deficit -> initial_allocation = historical_deficit per row.
-    requested_amount -> initial_allocation = current_request per row.
-    last_year_data -> initial_allocation = graduate_count per row.
-    Updates demand_requests.initial_allocation and adjustment_suggestions (red/yellow highlight).
+    Set allocations by the chosen priority; store in DB immediately (user_allocation, initial_allocation, final_allocation).
+    Uses bulk RPC for fast write. Persists session total_budget and national_pool_cap for run-geo.
     """
     try:
         session_resp = supabase.table("allocation_sessions").select("*").eq("id", session_id).execute()
@@ -757,13 +755,23 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
             raise HTTPException(status_code=404, detail="Session not found")
         session = session_resp.data[0]
         total_grants = request.total_grants if request.total_grants is not None else session.get("total_budget") or 0
+        national_pool_cap = request.national_pool_cap if request.national_pool_cap is not None else session.get("national_pool_cap")
+
+        # Persist session params for run-geo and UI
+        session_patch = {}
+        if request.total_grants is not None:
+            session_patch["total_budget"] = request.total_grants
+        if request.national_pool_cap is not None:
+            session_patch["national_pool_cap"] = request.national_pool_cap
+        if session_patch:
+            supabase.table("allocation_sessions").update(session_patch).eq("id", session_id).execute()
 
         demands_resp = supabase.table("demand_requests").select(
             "*, region:regions(id, name), specialty:specialties(id, name)"
         ).eq("session_id", session_id).execute()
         demands = demands_resp.data or []
         if not demands:
-            return {"status": "success", "message": "No demands to allocate", "updated": 0}
+            return {"status": "success", "message": "No demands to allocate", "updated": 0, "allocations": []}
 
         graduate_year = (session.get("year") or datetime.now().year) - 1
         graduates_resp = supabase.table("yearly_graduates").select("specialty, graduate_count").eq("year", graduate_year).execute()
@@ -797,51 +805,69 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
         if len(quotas) != len(demands):
             raise HTTPException(status_code=500, detail="Allocation length mismatch")
 
-        # Use final_allocation when set; only apply priority to rows without final_allocation
         for i, demand in enumerate(demands):
             if demand.get("final_allocation") is not None:
                 quotas[i] = int(demand["final_allocation"])
 
-        demand_ids = [d["id"] for d in demands]
+        # Bulk update demand_requests in one RPC call (user_allocation + initial + final for uni allocations)
+        updates = []
         for i, demand in enumerate(demands):
             new_alloc = quotas[i]
-            supabase.table("demand_requests").update({
+            updates.append({
+                "id": str(demand["id"]),
+                "user_allocation": new_alloc,
                 "initial_allocation": new_alloc,
                 "final_allocation": new_alloc,
-            }).eq("id", demand["id"]).execute()
+            })
+        rpc_resp = supabase.rpc("update_demand_allocations_bulk", {"updates": updates}).execute()
+        raw = rpc_resp.data
+        if isinstance(raw, list) and len(raw) > 0:
+            updated_count = int(raw[0])
+        elif raw is not None:
+            updated_count = int(raw)
+        else:
+            updated_count = len(updates)
 
-        for sid in demand_ids:
-            supabase.table("adjustment_suggestions").delete().eq("demand_request_id", sid).execute()
-
+        # Batch adjustment_suggestions: one delete for all, one insert for all
+        demand_ids = [d["id"] for d in demands]
+        if demand_ids:
+            supabase.table("adjustment_suggestions").delete().in_("demand_request_id", demand_ids).execute()
+        suggestions = []
         for i, demand in enumerate(demands):
             initial_allocation = quotas[i]
             hist = int(demand.get("historical_deficit") or 0)
             req = int(demand.get("current_request") or 0)
             max_need = max(hist, req)
-            # Red = allocation could be less (over-allocated). Yellow = allocation could be higher (under-allocated).
             if initial_allocation > max_need:
-                supabase.table("adjustment_suggestions").insert({
+                suggestions.append({
                     "demand_request_id": demand["id"],
                     "suggestion_type": "can_reduce",
                     "suggested_reduction": initial_allocation - max_need,
                     "reason": f"Можно уменьшить на {initial_allocation - max_need}",
                     "highlight_color": "red",
-                }).execute()
+                })
             elif initial_allocation < max_need:
-                supabase.table("adjustment_suggestions").insert({
+                suggestions.append({
                     "demand_request_id": demand["id"],
                     "suggestion_type": "under_allocated",
                     "suggested_reduction": 0,
                     "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})",
                     "highlight_color": "yellow",
-                }).execute()
+                })
+        if suggestions:
+            supabase.table("adjustment_suggestions").insert(suggestions).execute()
+
+        # Return allocations so frontend can show without refetch
+        allocations_resp = [{"demand_request_id": str(d["id"]), "user_allocation": quotas[i]} for i, d in enumerate(demands)]
 
         return {
             "status": "success",
             "message": f"Allocation run with priority={request.priority}",
-            "updated": len(demands),
+            "updated": updated_count,
             "total_grants": total_grants,
+            "national_pool_cap": national_pool_cap,
             "priority": request.priority,
+            "allocations": allocations_resp,
         }
     except HTTPException:
         raise
