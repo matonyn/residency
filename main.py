@@ -808,7 +808,7 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
 
         # Do not overwrite with existing final_allocation: "Выполнить" always applies chosen priority to all rows.
 
-        # Bulk update demand_requests in one RPC call (user_allocation + initial + final for uni allocations)
+        # Bulk update demand_requests: fast path via RPC; fallback to per-row so data is always stored
         updates = []
         for i, demand in enumerate(demands):
             new_alloc = quotas[i]
@@ -818,15 +818,28 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
                 "initial_allocation": new_alloc,
                 "final_allocation": new_alloc,
             })
-        # Pass as JSON string to avoid PostgREST 400 "JSON could not be generated" on large arrays
-        rpc_resp = supabase.rpc("update_demand_allocations_bulk", {"updates": json.dumps(updates)}).execute()
-        raw = rpc_resp.data
-        if isinstance(raw, list) and len(raw) > 0:
-            updated_count = int(raw[0])
-        elif raw is not None:
-            updated_count = int(raw)
-        else:
-            updated_count = len(updates)
+        updated_count = 0
+        try:
+            rpc_resp = supabase.rpc("update_demand_allocations_bulk", {"updates": json.dumps(updates)}).execute()
+            raw = rpc_resp.data
+            if isinstance(raw, list) and len(raw) > 0:
+                updated_count = int(raw[0])
+            elif raw is not None:
+                updated_count = int(raw)
+            else:
+                updated_count = len(updates)
+        except Exception as rpc_err:
+            pass  # fall through to per-row fallback
+        if updated_count == 0 and len(updates) > 0:
+            # RPC failed or updated no rows: persist via per-row update so data is stored
+            for i, demand in enumerate(demands):
+                new_alloc = quotas[i]
+                supabase.table("demand_requests").update({
+                    "user_allocation": new_alloc,
+                    "initial_allocation": new_alloc,
+                    "final_allocation": new_alloc,
+                }).eq("id", demand["id"]).execute()
+                updated_count += 1
 
         # Batch adjustment_suggestions: one delete for all, one insert for all
         demand_ids = [d["id"] for d in demands]
