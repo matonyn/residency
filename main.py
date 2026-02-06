@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -819,7 +820,8 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
                 "initial_allocation": new_alloc,
                 "final_allocation": new_alloc,
             })
-        rpc_resp = supabase.rpc("update_demand_allocations_bulk", {"updates": updates}).execute()
+        # Pass as JSON string to avoid PostgREST 400 "JSON could not be generated" on large arrays
+        rpc_resp = supabase.rpc("update_demand_allocations_bulk", {"updates": json.dumps(updates)}).execute()
         raw = rpc_resp.data
         if isinstance(raw, list) and len(raw) > 0:
             updated_count = int(raw[0])
