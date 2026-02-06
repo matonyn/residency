@@ -806,9 +806,7 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
         if len(quotas) != len(demands):
             raise HTTPException(status_code=500, detail="Allocation length mismatch")
 
-        for i, demand in enumerate(demands):
-            if demand.get("final_allocation") is not None:
-                quotas[i] = int(demand["final_allocation"])
+        # Do not overwrite with existing final_allocation: "Выполнить" always applies chosen priority to all rows.
 
         # Bulk update demand_requests in one RPC call (user_allocation + initial + final for uni allocations)
         updates = []
