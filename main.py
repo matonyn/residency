@@ -40,6 +40,9 @@ PRIORITY_ORDER = {
 KAZNMU_PRIMARY_KEYWORDS = ("алматы", "жетысуская", "алматинская")
 KAZNMU_SECONDARY_KEYWORDS = ("жамбылская", "туркестанская", "кызылординская", "шымкент")
 
+# КАЗНМУ + МКТУ combined grants cap (total across all regions/specialties)
+NATIONAL_POOL_CAP = 650
+
 
 def _find_kaznmu_id(supabase_client):
     """Return university id for КАЗНМУ (name contains КазНМУ or Асфендиярова), or None."""
@@ -52,6 +55,53 @@ def _find_kaznmu_id(supabase_client):
     except Exception:
         pass
     return None
+
+
+def _find_mktu_id(supabase_client):
+    """Return university id for МКТУ (name contains МКТУ, МКУТ, казахско-турецк, халеля сапаева, etc.), or None."""
+    try:
+        data = supabase_client.table("universities").select("id, name").execute().data or []
+        for row in data:
+            name = (row.get("name") or "").strip().lower()
+            if "мкту" in name or "мкут" in name or "казахско-турецк" in name or "халеля сапаева" in name or "международный казахско" in name:
+                return str(row.get("id"))
+    except Exception:
+        pass
+    return None
+
+
+def _national_pool_university_ids(supabase_client) -> Set[str]:
+    """Return set of university ids that share the national pool cap (КАЗНМУ + МКТУ)."""
+    ids = set()
+    kaznmu = _find_kaznmu_id(supabase_client)
+    mktu = _find_mktu_id(supabase_client)
+    if kaznmu:
+        ids.add(kaznmu)
+    if mktu:
+        ids.add(mktu)
+    return ids
+
+
+def _get_national_pool_cap(supabase_client, session_id: Optional[str]) -> int:
+    """Return national pool cap from session (national_pool_cap) or default NATIONAL_POOL_CAP."""
+    if not session_id:
+        return NATIONAL_POOL_CAP
+    try:
+        row = (
+            supabase_client.table("allocation_sessions")
+            .select("national_pool_cap")
+            .eq("id", session_id)
+            .execute()
+        )
+        data = (row.data or [{}])[0] if row.data else {}
+        val = data.get("national_pool_cap")
+        if val is not None:
+            n = int(val)
+            if n >= 0:
+                return n
+    except Exception:
+        pass
+    return NATIONAL_POOL_CAP
 
 
 def _kaznmu_rank_for_region(region_name_normalized: str) -> int:
@@ -292,13 +342,19 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
     if not demands or not supply_keys:
         return []
 
+    # National pool (КАЗНМУ + МКТУ): cap from session rule or default
+    national_pool_cap = _get_national_pool_cap(supabase_client, session_id)
+    national_pool_ids = _national_pool_university_ids(supabase_client)
+    national_pool_supply_indices = {j for j in range(len(supply_keys)) if supply_keys[j][0] in national_pool_ids}
+    national_pool_used = [0]  # mutable: total allocated to pool so far
+
     n_d, n_s = len(demands), len(supply_keys)
     demand_start, supply_start = 2, 2 + n_d
-    num_nodes = 2 + n_d + n_s
+    pool_node = 2 + n_d + n_s
+    num_nodes = 2 + n_d + n_s + (1 if national_pool_supply_indices else 0)
     allocations = []
 
     def run_phase(tier_role: Optional[str], fallback_same_specialty_only: bool):
-        # Build edges: source->demand, demand->supply, supply->sink
         edges = []
         for i, d in enumerate(demands):
             if d["remaining_needed"] <= 0:
@@ -332,17 +388,24 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
                 elif fallback_same_specialty_only:
                     pass  # any uid with same specialty
                 edges.append((demand_start + i, supply_start + j, min(d["remaining_needed"], avail)))
+        # Supply -> sink (or -> pool for КАЗНМУ/МКТУ, then pool -> sink with cap 650)
         for j in range(n_s):
             uid, sid = supply_keys[j]
             cap = supply_map.get((uid, sid), 0)
-            if cap > 0:
+            if cap <= 0:
+                continue
+            if j in national_pool_supply_indices:
+                edges.append((supply_start + j, pool_node, cap))
+            else:
                 edges.append((supply_start + j, SINK, cap))
+        if national_pool_supply_indices:
+            pool_cap = max(0, national_pool_cap - national_pool_used[0])
+            edges.append((pool_node, SINK, pool_cap))
 
-        # Deduplicate demand->supply: same (i,j) can appear multiple times from inner loop
         seen_ds = set()
         unique_ds_edges = []
         for e in edges:
-            if e[0] >= demand_start and e[0] < supply_start and e[1] >= supply_start:
+            if e[0] >= demand_start and e[0] < supply_start and e[1] >= supply_start and e[1] < pool_node:
                 i, j = (e[0] - demand_start), (e[1] - supply_start)
                 if (i, j) in seen_ds:
                     continue
@@ -352,10 +415,9 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
                 unique_ds_edges.append(e)
         edges = unique_ds_edges
 
-        # Run max-flow
         total, residual = _max_flow_dinic(num_nodes, edges, SOURCE, SINK)
         for u, v, cap in edges:
-            if u >= demand_start and u < supply_start and v >= supply_start:
+            if u >= demand_start and u < supply_start and v >= supply_start and v < pool_node:
                 flow = cap - residual.get((u, v), cap)
                 if flow <= 0:
                     continue
@@ -366,11 +428,11 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
                 allocations.append({"region_id": rid, "specialty_id": sid, "university_id": uid, "allocated_count": flow})
                 demands[di]["remaining_needed"] -= flow
                 supply_map[(uid, sid)] = supply_map.get((uid, sid), 0) - flow
+                if uid in national_pool_ids:
+                    national_pool_used[0] += flow
 
-    # Tier phases
     for tier in ALLOCATION_TIERS:
         run_phase(tier["role"], fallback_same_specialty_only=False)
-    # Fallback: any university with same specialty
     run_phase(None, fallback_same_specialty_only=True)
 
     consolidated = defaultdict(int)
