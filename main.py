@@ -832,8 +832,13 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
 
         # Batch adjustment_suggestions: one delete for all, one insert for all
         demand_ids = [d["id"] for d in demands]
+        # NOTE: large IN(...) lists can exceed PostgREST limits and return 400 Bad Request (non-JSON).
+        # Delete in chunks to keep requests small and reliable.
         if demand_ids:
-            supabase.table("adjustment_suggestions").delete().in_("demand_request_id", demand_ids).execute()
+            DELETE_CHUNK = 200
+            for j in range(0, len(demand_ids), DELETE_CHUNK):
+                chunk = demand_ids[j:j + DELETE_CHUNK]
+                supabase.table("adjustment_suggestions").delete().in_("demand_request_id", chunk).execute()
         suggestions = []
         for i, demand in enumerate(demands):
             initial_allocation = quotas[i]
@@ -856,8 +861,11 @@ async def run_allocation(session_id: str, request: RunAllocationRequest):
                     "reason": f"Выделено ({initial_allocation}) меньше потребности ({max_need})",
                     "highlight_color": "yellow",
                 })
+        # Insert in chunks as well (payload size safety)
         if suggestions:
-            supabase.table("adjustment_suggestions").insert(suggestions).execute()
+            INSERT_CHUNK = 500
+            for j in range(0, len(suggestions), INSERT_CHUNK):
+                supabase.table("adjustment_suggestions").insert(suggestions[j:j + INSERT_CHUNK]).execute()
 
         # Return allocations so frontend can show without refetch
         allocations_resp = [{"demand_request_id": str(d["id"]), "user_allocation": quotas[i]} for i, d in enumerate(demands)]
