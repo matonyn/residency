@@ -2,7 +2,6 @@ import os
 import re
 from datetime import datetime, timezone
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Literal, Set, Tuple, Dict
 from fastapi import FastAPI, HTTPException, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -281,14 +280,10 @@ def _compute_geo_university_allocations(supabase_client, demand_filter: Optional
     """
     SOURCE, SINK = 0, 1
 
-    # Fetch all 3 tables in parallel
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        cap_future = ex.submit(_fetch_capacity, supabase_client)
-        demands_future = ex.submit(_fetch_demands, supabase_client)
-        prox_future = ex.submit(_fetch_proximity, supabase_client)
-        cap_data = cap_future.result()
-        demands_data = demands_future.result()
-        prox_data = prox_future.result()
+    # Fetch sequentially: Supabase/httpx client is not safe for concurrent use from multiple threads (HTTP/2 connection can be terminated).
+    cap_data = _fetch_capacity(supabase_client)
+    demands_data = _fetch_demands(supabase_client)
+    prox_data = _fetch_proximity(supabase_client)
 
     # 1. Supply map and ordered supply list for graph nodes
     supply_map = {}
