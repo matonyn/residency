@@ -1310,6 +1310,20 @@ async def compute_geo_university_allocations(
         if body and body.region_id and body.specialty_id:
             demand_filter = {(body.region_id, body.specialty_id)}
         session_id = body.session_id if body else None
+        # When no session_id is sent, use latest session so we never run over ALL demands (all sessions) and get wrong numbers.
+        if not session_id:
+            try:
+                row = (
+                    supabase.table("allocation_sessions")
+                    .select("id")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if row.data and len(row.data) > 0:
+                    session_id = str(row.data[0].get("id") or "").strip() or None
+            except Exception:
+                pass
         assignments = _compute_geo_university_allocations(supabase, demand_filter=demand_filter, session_id=session_id)
         if save and assignments:
             try:
