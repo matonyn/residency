@@ -1,9 +1,10 @@
 # Render Blueprint: residency backend as Docker (Tesseract for PassportEye)
-# Set "name" to the exact name of your existing Render web service.
+# Name must match your existing Render web service exactly.
 
 services:
   - type: web
     name: residency-fzy4
     runtime: docker
+    plan: free
     dockerfilePath: Dockerfile
     dockerCommand: '/bin/sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"'
