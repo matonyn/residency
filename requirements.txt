@@ -4,5 +4,8 @@ pandas
 python-dotenv
 supabase
 uvicorn
+websockets>=14.0,<16
 openpyxl
 python-multipart
+PassportEye>=2.2.0
+pymupdf>=1.24.0
