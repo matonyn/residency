@@ -29,6 +29,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Suppress PassportEye/scikit-image FutureWarnings (skimage.io plugin, morphology.square)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 # --- Constants based on User Logic ---
 PRIORITY_ORDER = {
     "primary": 1,      # 60-95% target
