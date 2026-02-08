@@ -2,6 +2,7 @@ import json
 import os
 import re
 import tempfile
+import warnings
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import List, Optional, Literal, Set, Tuple, Dict
@@ -147,7 +148,10 @@ def validate_passport_pdf(pdf_content: bytes) -> dict:
     except Exception as e:
         return {"valid": False, "details": None, "error": f"PDF to image failed: {e}"}
     try:
-        mrz = read_mrz(img_path)
+        # Suppress PassportEye/scikit-image FutureWarnings (skimage.io plugin, morphology.square)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=FutureWarning)
+            mrz = read_mrz(img_path)
     except Exception as e:
         return {"valid": False, "details": None, "error": f"MRZ read failed: {e}"}
     finally:
