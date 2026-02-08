@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import List, Optional, Literal, Set, Tuple, Dict
@@ -114,6 +115,66 @@ def _kaznmu_rank_for_region(region_name_normalized: str) -> int:
     if any(kw in r for kw in KAZNMU_SECONDARY_KEYWORDS):
         return 2
     return 3
+
+
+# --- Passport validation (PassportEye) ---
+def validate_passport_pdf(pdf_content: bytes) -> dict:
+    """
+    Validate a passport PDF using PassportEye (MRZ extraction).
+    Converts the first PDF page to an image, then runs MRZ detection.
+    Returns: { "valid": bool, "details": dict | None, "error": str | None }.
+    """
+    try:
+        import fitz  # PyMuPDF
+        from passporteye import read_mrz
+    except ImportError as e:
+        return {"valid": False, "details": None, "error": f"Missing dependency: {e}"}
+
+    pdf_path = None
+    img_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_content)
+            pdf_path = f.name
+        doc = fitz.open(pdf_path)
+        if doc.page_count == 0:
+            return {"valid": False, "details": None, "error": "PDF has no pages"}
+        page = doc.load_page(0)
+        pix = page.get_pixmap(dpi=150)
+        img_path = pdf_path + ".png"
+        pix.save(img_path)
+        doc.close()
+    except Exception as e:
+        return {"valid": False, "details": None, "error": f"PDF to image failed: {e}"}
+    try:
+        mrz = read_mrz(img_path)
+    except Exception as e:
+        return {"valid": False, "details": None, "error": f"MRZ read failed: {e}"}
+    finally:
+        for p in (img_path, pdf_path):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    if mrz is None:
+        return {"valid": False, "details": None, "error": "No passport MRZ detected in the document"}
+    try:
+        details = mrz.to_dict() if hasattr(mrz, "to_dict") else {}
+    except Exception:
+        details = {}
+    valid = True
+    v = getattr(mrz, "valid_number", None)
+    if v is not None and not (v() if callable(v) else v):
+        valid = False
+    v = getattr(mrz, "valid_date_of_birth", None)
+    if v is not None and not (v() if callable(v) else v):
+        valid = False
+    v = getattr(mrz, "valid_expiration_date", None)
+    if v is not None and not (v() if callable(v) else v):
+        valid = False
+    return {"valid": valid, "details": details, "error": None}
 
 
 # --- Pydantic Models ---
@@ -568,6 +629,28 @@ async def upload_file(session_id: str, file: UploadFile = File(...)):
     except Exception as e:
         import traceback
         print("Upload error:", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/passport/validate")
+async def validate_passport(file: UploadFile = File(...)):
+    """
+    Validate a passport PDF using PassportEye (MRZ extraction).
+    Accepts a PDF file; returns { "valid": bool, "details": {...} | null, "error": str | null }.
+    """
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a PDF file")
+    try:
+        content = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+    if not content:
+        raise HTTPException(status_code=400, detail="File is empty")
+    try:
+        return validate_passport_pdf(content)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
