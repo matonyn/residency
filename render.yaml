@@ -1,0 +1,17 @@
+# Render Blueprint: switch residency backend to Docker (Tesseract for PassportEye)
+# Sync this Blueprint so the existing service uses the Dockerfile and gets Tesseract.
+#
+# IMPORTANT: Set "name" below to the EXACT name of your existing residency backend
+# service in Render (Dashboard → service → name at top). Example: if your URL is
+# https://residency-fzy4.onrender.com, the service name is often "residency-fzy4".
+# If the name doesn't match an existing service, Render will create a new one.
+
+# This repo is back_residency only (no parent monorepo). Root = repo root.
+services:
+  - type: web
+    name: residency-fzy4   # <-- Change this to your actual Render service name
+    runtime: docker
+    dockerfilePath: Dockerfile
+    # Listen on Render's PORT (required for web services)
+    dockerCommand: /bin/sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+    # Env vars (SUPABASE_URL, SUPABASE_SERVICE_KEY) are set in Dashboard; no need to duplicate here unless you want them in YAML.
